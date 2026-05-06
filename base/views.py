@@ -729,6 +729,8 @@ def google_oauth_callback(request):
     code_verifier = request.session.pop("google_oauth_code_verifier", None)
 
     try:
+        # Relax scope checking — Google may return scopes in a different order
+        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
         flow = _build_google_flow(request)
         # Restore PKCE verifier so Google can validate the code challenge
         if code_verifier:
@@ -745,6 +747,10 @@ def google_oauth_callback(request):
             clock_skew_in_seconds=10,
         )
     except Exception as exc:
+        import sys
+        import traceback
+        print(f"[google-oauth] callback error: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         logger.error("Google OAuth callback failed: %s", exc, exc_info=True)
         messages.error(request, "Google sign-in failed. Please try again.")
         return redirect("login")
