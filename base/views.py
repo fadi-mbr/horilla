@@ -675,17 +675,17 @@ def _build_google_flow(request):
 
 def google_oauth_init(request):
     """Redirect the browser to Google's OAuth consent screen."""
+    import logging
+    import secrets as _secrets
+
     if not settings.GOOGLE_CLIENT_ID:
         messages.error(request, "Google sign-in is not configured.")
         return redirect("login")
 
     flow = _build_google_flow(request)
 
-    import secrets as _secrets
-
     state = _secrets.token_urlsafe(32)
     request.session["google_oauth_state"] = state
-    # Persist next URL so the callback can honour it
     request.session["google_oauth_next"] = request.GET.get("next", "/")
 
     auth_url, _ = flow.authorization_url(
@@ -695,19 +695,27 @@ def google_oauth_init(request):
         prompt="select_account",
         include_granted_scopes="true",
     )
+
+    # Persist PKCE code verifier so the callback can prove ownership to Google
+    if getattr(flow, "code_verifier", None):
+        request.session["google_oauth_code_verifier"] = flow.code_verifier
+
     return redirect(auth_url)
 
 
 def google_oauth_callback(request):
     """Handle the redirect back from Google, authenticate, and log the user in."""
+    import logging
     import os
 
     import google.auth.transport.requests
     from google.oauth2 import id_token as google_id_token
 
+    logger = logging.getLogger(__name__)
+
     error = request.GET.get("error")
     if error:
-        messages.error(request, f"Google sign-in was cancelled or denied.")
+        messages.error(request, "Google sign-in was cancelled or denied.")
         return redirect("login")
 
     # CSRF — validate state
@@ -718,11 +726,13 @@ def google_oauth_callback(request):
         return redirect("login")
 
     next_url = request.session.pop("google_oauth_next", "/")
+    code_verifier = request.session.pop("google_oauth_code_verifier", None)
 
     try:
-        # Allow non-HTTPS in local dev (Coolify always uses HTTPS in prod)
-        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "0")
         flow = _build_google_flow(request)
+        # Restore PKCE verifier so Google can validate the code challenge
+        if code_verifier:
+            flow.code_verifier = code_verifier
         flow.fetch_token(code=request.GET.get("code"))
         credentials = flow.credentials
 
@@ -734,7 +744,8 @@ def google_oauth_callback(request):
             settings.GOOGLE_CLIENT_ID,
             clock_skew_in_seconds=10,
         )
-    except Exception:
+    except Exception as exc:
+        logger.error("Google OAuth callback failed: %s", exc, exc_info=True)
         messages.error(request, "Google sign-in failed. Please try again.")
         return redirect("login")
 
