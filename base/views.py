@@ -752,7 +752,7 @@ def google_oauth_callback(request):
         print(f"[google-oauth] callback error: {exc}", file=sys.stderr, flush=True)
         traceback.print_exc(file=sys.stderr)
         logger.error("Google OAuth callback failed: %s", exc, exc_info=True)
-        messages.error(request, "Google sign-in failed. Please try again.")
+        messages.error(request, f"Google sign-in failed: {type(exc).__name__}: {exc}")
         return redirect("login")
 
     email = id_info.get("email", "").lower()
