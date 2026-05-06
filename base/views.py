@@ -641,6 +641,137 @@ def reset_send_success(request):
     return render(request, "reset_send.html")
 
 
+# ---------------------------------------------------------------------------
+# Google OAuth — native Horilla sign-in
+# Uses google-auth-oauthlib (already in requirements.txt).
+# Flow: /login/google/ → Google consent → /login/google/callback/
+# CF Access (@mbrme.com gate) is the outer perimeter; this is the inner SSO.
+# ---------------------------------------------------------------------------
+
+def _build_google_flow(request):
+    """Return a configured Flow with the callback URI bound to this request."""
+    import secrets as _secrets
+
+    from google_auth_oauthlib.flow import Flow
+
+    client_config = {
+        "web": {
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [
+                request.build_absolute_uri(reverse("google-oauth-callback"))
+            ],
+        }
+    }
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=["openid", "email", "profile"],
+    )
+    flow.redirect_uri = request.build_absolute_uri(reverse("google-oauth-callback"))
+    return flow
+
+
+def google_oauth_init(request):
+    """Redirect the browser to Google's OAuth consent screen."""
+    if not settings.GOOGLE_CLIENT_ID:
+        messages.error(request, "Google sign-in is not configured.")
+        return redirect("login")
+
+    flow = _build_google_flow(request)
+
+    import secrets as _secrets
+
+    state = _secrets.token_urlsafe(32)
+    request.session["google_oauth_state"] = state
+    # Persist next URL so the callback can honour it
+    request.session["google_oauth_next"] = request.GET.get("next", "/")
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        state=state,
+        hd=settings.GOOGLE_OAUTH_ALLOWED_DOMAIN,
+        prompt="select_account",
+        include_granted_scopes="true",
+    )
+    return redirect(auth_url)
+
+
+def google_oauth_callback(request):
+    """Handle the redirect back from Google, authenticate, and log the user in."""
+    import os
+
+    import google.auth.transport.requests
+    from google.oauth2 import id_token as google_id_token
+
+    error = request.GET.get("error")
+    if error:
+        messages.error(request, f"Google sign-in was cancelled or denied.")
+        return redirect("login")
+
+    # CSRF — validate state
+    expected_state = request.session.pop("google_oauth_state", None)
+    returned_state = request.GET.get("state")
+    if not expected_state or expected_state != returned_state:
+        messages.error(request, "Authentication failed: invalid state parameter.")
+        return redirect("login")
+
+    next_url = request.session.pop("google_oauth_next", "/")
+
+    try:
+        # Allow non-HTTPS in local dev (Coolify always uses HTTPS in prod)
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "0")
+        flow = _build_google_flow(request)
+        flow.fetch_token(code=request.GET.get("code"))
+        credentials = flow.credentials
+
+        # Verify the ID token with Google's public keys
+        google_request = google.auth.transport.requests.Request()
+        id_info = google_id_token.verify_oauth2_token(
+            credentials.id_token,
+            google_request,
+            settings.GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=10,
+        )
+    except Exception:
+        messages.error(request, "Google sign-in failed. Please try again.")
+        return redirect("login")
+
+    email = id_info.get("email", "").lower()
+    if not email.endswith(f"@{settings.GOOGLE_OAUTH_ALLOWED_DOMAIN}"):
+        messages.error(
+            request,
+            f"Sign-in is restricted to @{settings.GOOGLE_OAUTH_ALLOWED_DOMAIN} accounts.",
+        )
+        return redirect("login")
+
+    user = User.objects.filter(email__iexact=email, is_active=True).first()
+    if not user:
+        messages.error(
+            request,
+            "No Horilla account found for this Google identity. Contact your administrator.",
+        )
+        return redirect("login")
+
+    employee = getattr(user, "employee_get", None)
+    if employee is None or not employee.is_active:
+        messages.error(
+            request,
+            "Your employee account is not active. Contact your administrator.",
+        )
+        return redirect("login")
+
+    # Specify backend explicitly (required when not going through authenticate())
+    user.backend = "django.contrib.auth.backends.ModelBackend"
+    login(request, user)
+    messages.success(request, f"Welcome, {user.get_full_name() or email}!")
+
+    if not url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}):
+        next_url = "/"
+    return redirect(next_url)
+
+
 class HorillaPasswordResetView(PasswordResetView):
     """
     Horilla View for Reset Password
