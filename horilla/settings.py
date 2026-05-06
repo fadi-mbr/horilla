@@ -189,6 +189,11 @@ CSRF_TRUSTED_ORIGINS = env("CSRF_TRUSTED_ORIGINS")
 
 LOGIN_URL = "/login"
 
+# Google OAuth — native Horilla sign-in (uses google-auth-oauthlib, already in requirements)
+GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", default="")
+GOOGLE_CLIENT_SECRET = env("GOOGLE_CLIENT_SECRET", default="")
+GOOGLE_OAUTH_ALLOWED_DOMAIN = env("GOOGLE_OAUTH_ALLOWED_DOMAIN", default="mbrme.com")
+
 
 SIMPLE_HISTORY_REVERT_DISABLED = True
 

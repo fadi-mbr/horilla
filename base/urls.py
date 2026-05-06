@@ -80,6 +80,8 @@ urlpatterns = [
     ),
     path("404", views.custom404, name="404"),
     path("login/", views.login_user, name="login"),
+    path("login/google/", views.google_oauth_init, name="google-oauth-init"),
+    path("login/google/callback/", views.google_oauth_callback, name="google-oauth-callback"),
     path(
         "forgot-password",
         views.HorillaPasswordResetView.as_view(),
