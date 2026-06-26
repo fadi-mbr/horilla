@@ -28,8 +28,8 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-horilla}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-horilla}
       REDIS_URL: redis://:${POSTGRES_PASSWORD}@redis:6379/0
       TIME_ZONE: ${TIME_ZONE:-Asia/Dubai}
-    expose:
-      - "8000"
+    ports:
+      - "8011:8000"
     depends_on:
       - db
       - redis
