@@ -29,12 +29,15 @@ class CloudflareAccessMiddleware(PersistentRemoteUserMiddleware):
 
     header = "HTTP_CF_ACCESS_AUTHENTICATED_USER_EMAIL"
 
-    def process_request(self, request):
-        super().process_request(request)
+    def __call__(self, request):
+        # The inherited RemoteUser process_request auto-logs-in from the header.
+        response = super().__call__(request)
         # Horilla's /login/ renders the form even for authenticated users, so
         # after CF Access auto-login send them straight to the dashboard.
-        if request.user.is_authenticated and request.path.rstrip("/") == "/login":
+        user = getattr(request, "user", None)
+        if user is not None and user.is_authenticated and request.path.rstrip("/") == "/login":
             return redirect("/")
+        return response
 
 
 class CloudflareAccessBackend(RemoteUserBackend):
