@@ -8,6 +8,7 @@ from distutils.version import (  # pylint: disable=no-name-in-module,import-erro
 from django import get_version
 from django.template import Library
 from django.utils.html import format_html
+from django.utils.safestring import mark_safe
 
 try:
     from django.urls import reverse
@@ -83,7 +84,7 @@ def register_notify_callbacks(
     for callback in callbacks.split(","):
         script += "register_notifier(" + callback + ");"
     script += "</script>"
-    return format_html(script)
+    return mark_safe(script)
 
 
 @register.simple_tag(takes_context=True)
@@ -95,13 +96,13 @@ def live_notify_badge(context, badge_class="live_notify_badge"):
     html = "<span class='{badge_class}'>{unread}</span>".format(
         badge_class=badge_class, unread=user.notifications.unread().count()
     )
-    return format_html(html)
+    return mark_safe(html)
 
 
 @register.simple_tag
 def live_notify_list(list_class="live_notify_list"):
     html = "<ul class='{list_class}'></ul>".format(list_class=list_class)
-    return format_html(html)
+    return mark_safe(html)
 
 
 def user_context(context):
