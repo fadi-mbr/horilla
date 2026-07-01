@@ -25,6 +25,12 @@ class CloudflareAccessMiddleware(PersistentRemoteUserMiddleware):
 
     header = "HTTP_CF_ACCESS_AUTHENTICATED_USER_EMAIL"
 
+    def process_request(self, request):
+        import sys
+        cf = {k: request.META[k] for k in request.META if k.startswith("HTTP_CF")}
+        print(f"CFDEBUG path={request.path} cf_headers={cf}", file=sys.stderr, flush=True)
+        return super().process_request(request)
+
 
 class CloudflareAccessBackend(RemoteUserBackend):
     """Match the CF Access email to an existing, active HorillaUser (no auto-provision)."""
