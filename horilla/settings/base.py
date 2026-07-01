@@ -132,6 +132,8 @@ MIDDLEWARE = [
     "django.middleware.locale.LocaleMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # MBR: Cloudflare Access SSO — auto-login from the CF Access identity header
+    "horilla.cf_access_auth.CloudflareAccessMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     # Horilla-specific middlewares
@@ -435,6 +437,7 @@ DEFAULT_LDAP_CONFIG = {
 }
 
 AUTHENTICATION_BACKENDS = [
+    "horilla.cf_access_auth.CloudflareAccessBackend",
     "django.contrib.auth.backends.ModelBackend",
     # "django_auth_ldap.backend.LDAPBackend",
 ]
