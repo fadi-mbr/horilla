@@ -29,6 +29,23 @@ class CloudflareAccessMiddleware(PersistentRemoteUserMiddleware):
 
     header = "HTTP_CF_ACCESS_AUTHENTICATED_USER_EMAIL"
 
+    def process_request(self, request):
+        # The base RemoteUser middleware decides "is this user already logged in?"
+        # by comparing request.user.get_username() to the header value. Our header
+        # carries an EMAIL while the matched user's USERNAME is different (e.g.
+        # "admin"), so that check never matches and the base class calls
+        # auth.login() on *every* request. Each login() rotates the CSRF token,
+        # which silently invalidates the token embedded in already-rendered forms
+        # — so every POST fails with 403 (GETs are unaffected, hence browsing
+        # works but no form ever saves). Short-circuit when the session already
+        # holds the user whose email matches the header: no re-login, no rotation.
+        email = request.META.get(self.header)
+        if email and request.user.is_authenticated:
+            current = (getattr(request.user, "email", "") or "").strip().lower()
+            if current == email.strip().lower():
+                return
+        return super().process_request(request)
+
     def __call__(self, request):
         # The inherited RemoteUser process_request auto-logs-in from the header.
         response = super().__call__(request)
