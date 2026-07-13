@@ -870,7 +870,8 @@ def export_data(request, *args, **kwargs):
     from horilla_views.generic.cbv.views import HorillaFormView
 
     request = getattr(_thread_locals, "request", None)
-    ids = eval_validate(request.POST["ids"])
+    _raw_ids = request.POST.get("ids") or ""
+    ids = eval_validate(_raw_ids) if str(_raw_ids).strip() else []
     _columns = eval_validate(request.POST["columns"])
     export_format = request.POST.get("format", "xlsx")
 
@@ -881,7 +882,9 @@ def export_data(request, *args, **kwargs):
     ):
         messages.info(f"You dont have view perm for model {model._meta.verbose_name}")
         return HorillaFormView.HttpResponse()
-    queryset = model.objects.filter(id__in=ids)
+    # Empty selection (no rows ticked) sends ids="" -> export all rows of the
+    # view's model instead of crashing into the generic error page.
+    queryset = model.objects.filter(id__in=ids) if ids else model.objects.all()
     export_fields = eval_validate(request.POST["export_fields"])
     export_file_name = request.POST["export_file_name"]
     export_file_name = sanitize_filename(export_file_name)
