@@ -19,7 +19,7 @@
       <div class="oh-modal__dialog-body">
         <form
           method="post"
-          action="/{{export_path}}"
+          action="{{export_path}}"
           onsubmit="
             const selectedFields = $('#{{view_id|safe}} input[name=selected_fields]:checked').map(function() {
                 return [[$(this).attr('data-label'),this.value]];
