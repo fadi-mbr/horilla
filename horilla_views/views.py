@@ -885,8 +885,8 @@ def export_data(request, *args, **kwargs):
     # Empty selection (no rows ticked) sends ids="" -> export all rows of the
     # view's model instead of crashing into the generic error page.
     queryset = model.objects.filter(id__in=ids) if ids else model.objects.all()
-    export_fields = eval_validate(request.POST["export_fields"])
-    export_file_name = request.POST["export_file_name"]
+    export_fields = eval_validate(request.POST.get("export_fields") or "[]")
+    export_file_name = request.POST.get("export_file_name") or "quick_export"
     export_file_name = sanitize_filename(export_file_name)
 
     _model = model
