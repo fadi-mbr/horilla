@@ -7,6 +7,7 @@ communication with the API, including fetching and validating tokens, and retrie
 attendance records .
 """
 
+import time
 from datetime import datetime
 
 import requests
@@ -140,7 +141,7 @@ class CrossChexCloudAPI:
         """Get attendance records, optimizing token usage and handling pagination."""
         all_records = []
         token = token or self.get_token()[0]
-        retried = False
+        attempts = 0
 
         while True:
             payload_data = self.get_attendance_payload(
@@ -155,19 +156,23 @@ class CrossChexCloudAPI:
 
             payload = response.get("payload") if isinstance(response, dict) else None
             if not isinstance(payload, dict) or "list" not in payload:
-                # Error response instead of records — typically a stale token
-                # (e.g. the device's stored api_token) answered with a
-                # System/Exception body. Mint a fresh token once and retry
-                # this page before giving up.
-                if not retried:
-                    retried = True
+                # Error body instead of records: either a stale token (the
+                # device's stored api_token answers with System/Exception) or
+                # FREQUENT_REQUEST (CrossChex allows one request per 15s).
+                attempts += 1
+                if attempts > 4:
+                    raise RuntimeError(
+                        f"CrossChex error response for attendance.record/getrecord: {payload!r}"
+                    )
+                time.sleep(16)  # respect the 15s interface limit before any retry
+                err_type = payload.get("type") if isinstance(payload, dict) else None
+                if err_type != "FREQUENT_REQUEST":
                     self.token = None
                     token = self.get_token()[0]
-                    continue
-                raise RuntimeError(
-                    f"CrossChex error response for attendance.record/getrecord: {payload!r}"
-                )
+                    time.sleep(16)  # the token call counts toward the limit too
+                continue
 
+            attempts = 0
             records = payload["list"]
             all_records.extend(records)
 
@@ -176,6 +181,7 @@ class CrossChexCloudAPI:
                 break
 
             page += 1
+            time.sleep(16)  # pace multi-page backlog fetches under the 15s limit
 
         return {
             "token": self.token,

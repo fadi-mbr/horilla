@@ -2,6 +2,7 @@
 Django application configuration for the biometric app.
 """
 
+import fcntl
 import logging
 import sys
 
@@ -55,6 +56,15 @@ class BiometricConfig(AppConfig):
         if "gunicorn" not in argv and "runserver" not in argv:
             return
         if _ANVIZ_SCHEDULER is not None:
+            return
+
+        # Gunicorn runs several workers and each imports this app; only the
+        # worker that wins this container-local flock runs the scheduler,
+        # otherwise every worker would fetch (and trip CrossChex's 15s limit).
+        try:
+            self._anviz_lock_fh = open("/tmp/horilla-anviz-scheduler.lock", "w")
+            fcntl.flock(self._anviz_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
             return
 
         try:
