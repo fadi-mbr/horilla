@@ -2302,6 +2302,25 @@ def anviz_biometric_attendance_logs(device):
         date_time_obj = date_time_utc.astimezone(django_timezone.get_current_timezone())
         employee = Employee.objects.filter(badge_id=badge_id).first()
         if employee:
+            # Idempotency guard: overlapping fetch windows re-deliver punches
+            # (the window opens at the previous run's START, and a paced
+            # multi-page fetch can outlive the 5-min schedule). Re-importing a
+            # punch duplicates activities and — worse — a replayed IN nulls
+            # attendance_clock_out on the day row. Skip punches already stored.
+            if punch_code in {0, 128}:
+                already_imported = AttendanceActivity.objects.filter(
+                    employee_id=employee,
+                    clock_in_date=date_time_obj.date(),
+                    clock_in=date_time_obj.time(),
+                ).exists()
+            else:
+                already_imported = AttendanceActivity.objects.filter(
+                    employee_id=employee,
+                    clock_out_date=date_time_obj.date(),
+                    clock_out=date_time_obj.time(),
+                ).exists()
+            if already_imported:
+                continue
             request_data = Request(
                 user=employee.employee_user_id,
                 date=date_time_obj.date(),
