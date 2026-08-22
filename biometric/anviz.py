@@ -140,6 +140,7 @@ class CrossChexCloudAPI:
         """Get attendance records, optimizing token usage and handling pagination."""
         all_records = []
         token = token or self.get_token()[0]
+        retried = False
 
         while True:
             payload_data = self.get_attendance_payload(
@@ -152,10 +153,25 @@ class CrossChexCloudAPI:
             )
             response = self._post(payload_data)
 
-            records = response["payload"]["list"]
+            payload = response.get("payload") if isinstance(response, dict) else None
+            if not isinstance(payload, dict) or "list" not in payload:
+                # Error response instead of records — typically a stale token
+                # (e.g. the device's stored api_token) answered with a
+                # System/Exception body. Mint a fresh token once and retry
+                # this page before giving up.
+                if not retried:
+                    retried = True
+                    self.token = None
+                    token = self.get_token()[0]
+                    continue
+                raise RuntimeError(
+                    f"CrossChex error response for attendance.record/getrecord: {payload!r}"
+                )
+
+            records = payload["list"]
             all_records.extend(records)
 
-            page_count = response["payload"]["pageCount"]
+            page_count = payload["pageCount"]
             if page >= page_count:
                 break
 
