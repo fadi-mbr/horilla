@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from datetime import datetime
-from distutils.util import strtobool
 from operator import itemgetter
 from urllib.parse import parse_qs
 
@@ -19,6 +18,7 @@ from django.views.decorators.http import require_http_methods
 
 from base.forms import TagsForm
 from base.methods import (
+    closest_numbers,
     filtersubordinates,
     get_key_instances,
     is_reportingmanager,
@@ -73,6 +73,14 @@ from notifications.signals import notify
 logger = logging.getLogger(__name__)
 
 # Create your views here.
+
+
+def strtobool(val):
+    return str(val).lower() in ("y", "yes", "t", "true", "on", "1")
+
+
+def strtobool(val):
+    return str(val).lower() in ("y", "yes", "t", "true", "on", "1")
 
 
 @login_required
@@ -599,6 +607,46 @@ def ticket_archive(request, ticket_id):
 
 
 @login_required
+def ticket_status_change(request, ticket_id):
+    if request.method != "POST":
+        messages.error(request, _("Invalid request method."))
+        return HttpResponse("error")
+    ticket = Ticket.objects.get(id=ticket_id)
+    status = request.POST.get("status")
+    ticket.status = status
+    if ticket.status == "resolved":
+        ticket.resolved_date = datetime.today()
+    ticket.save()
+
+    employees = ticket.assigned_to.all()
+    assignees = [employee.employee_user_id for employee in employees]
+    assignees.append(ticket.employee_id.employee_user_id)
+    if hasattr(ticket.get_raised_on_object(), "dept_manager"):
+        if ticket.get_raised_on_object().dept_manager.all():
+            manager = ticket.get_raised_on_object().dept_manager.all().first().manager
+            assignees.append(manager.employee_user_id)
+    notify.send(
+        request.user.employee_get,
+        recipient=assignees,
+        verb=f"The status of the ticket has been changed to {ticket.status}.",
+        verb_ar="تم تغيير حالة التذكرة.",
+        verb_de="Der Status des Tickets wurde geändert.",
+        verb_es="El estado del ticket ha sido cambiado.",
+        verb_fr="Le statut du ticket a été modifié.",
+        icon="infinite",
+        redirect=reverse("ticket-detail", kwargs={"ticket_id": ticket.id}),
+    )
+    mail_thread = TicketSendThread(
+        request,
+        ticket,
+        type="status_change",
+    )
+    mail_thread.start()
+    messages.success(request, _("The Ticket status updated successfully."))
+    return HttpResponse("success")
+
+
+@login_required
 # @ticket_owner_can_enter(perm="helpdesk.change_ticket", model=Ticket)
 def change_ticket_status(request, ticket_id):
     """
@@ -902,6 +950,10 @@ def ticket_detail(request, ticket_id, **kwargs):
         else:
             rating = "3"
 
+        value = request.session.get("ordered_ids_ticket", [])
+        ids = list(map(int, value))
+        prev_id, next_id = closest_numbers(ids, ticket_id)
+
         context = {
             "ticket": ticket,
             "c_form": c_form,
@@ -914,6 +966,8 @@ def ticket_detail(request, ticket_id, **kwargs):
             "color": color,
             "remaining": remaining,
             "rating": rating,
+            "prev_id": prev_id,
+            "next_id": next_id,
         }
         return render(request, "helpdesk/ticket/ticket_detail.html", context=context)
     else:
@@ -1535,10 +1589,12 @@ def update_department_manager(request, dep_id):
 @permission_required("helpdesk.delete_departmentmanager")
 def delete_department_manager(request, dep_id):
     department_manager = DepartmentManager.objects.get(id=dep_id)
+    count = DepartmentManager.objects.count()
     department_manager.delete()
     messages.success(request, _("The department manager has been deleted successfully"))
-
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    if count == 1:
+        return HttpResponse("<script>$('.reload-record').click();</script>")
+    return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
 
 
 @login_required
@@ -1656,11 +1712,21 @@ def ticket_type_update(request, t_type_id):
 def ticket_type_delete(request, t_type_id):
     ticket_type = TicketType.find(t_type_id)
     if ticket_type:
-        ticket_type.delete()
-        messages.success(request, _("Ticket type has been deleted successfully!"))
-    else:
-        messages.error(request, _("Ticket type not found"))
-    return HttpResponse()
+        try:
+            ticket_type.delete()
+            messages.success(request, _("Ticket type has been deleted successfully!"))
+            count = TicketType.objects.count
+            if count == 0:
+                return HttpResponse("<script>$('.reload-record').click()</script>")
+            else:
+                return HttpResponse(
+                    "<script>$('#reloadMessagesButton').click()</script>"
+                )
+        except:
+            messages.error(request, _("Ticket type can not delete"))
+            return HttpResponse("<script>$('.reload-record').click()</script>")
+    # return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return HttpResponse("<script>$('#reloadMessagesButton').click()</script>")
 
 
 @login_required
@@ -1680,7 +1746,7 @@ def view_department_managers(request):
 @permission_required("helpdesk.change_departmentmanager")
 def get_department_employees(request):
     """
-    Method to return employee in the department
+    Method to return employees in the department.
     """
     department = (
         Department.objects.filter(id=request.GET.get("dep_id")).first()
@@ -1688,9 +1754,10 @@ def get_department_employees(request):
         else None
     )
     if department:
-        employees_queryset = department.employeeworkinformation_set.all().values_list(
-            "employee_id__id", "employee_id__employee_first_name"
-        )
+        employees_qs = department.employeeworkinformation_set.all()
+        employees_queryset = [
+            (emp.employee_id.id, emp.employee_id) for emp in employees_qs
+        ]
     else:
         employees_queryset = None
     employees = list(employees_queryset)
@@ -1808,5 +1875,32 @@ def load_faqs(request):
         {
             "faqs": processed_faqs,
             "catagories": category_lookup,
+        },
+    )
+
+
+@login_required
+@hx_request_required
+def ticket_file_upload(request, id):
+    """
+    This function is used to upload files to the ticket.
+    """
+    ticket = Ticket.objects.get(id=id)
+    if request.method == "POST":
+        files = request.FILES.getlist("file")
+
+        for file in files:
+            a_form = AttachmentForm({"file": file, "ticket": ticket, "comment": None})
+            a_form.save()
+        messages.success(request, _("File(s) uploaded successfully."))
+
+    return render(
+        request,
+        "helpdesk/ticket/ticket_detail.html",
+        {
+            "ticket": ticket,
+            "attachments": ticket.ticket_attachment.all(),
+            "next_id": id,
+            "prev_id": id,
         },
     )

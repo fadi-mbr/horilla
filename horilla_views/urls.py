@@ -6,7 +6,7 @@ from django.urls import path
 
 from horilla_views import views
 from horilla_views.generic.cbv import history
-from horilla_views.generic.cbv.views import ReloadMessages
+from horilla_views.generic.cbv.views import HorillaListView, ReloadMessages
 
 urlpatterns = [
     path("toggle-columns", views.ToggleColumn.as_view(), name="toggle-columns"),
@@ -49,5 +49,41 @@ urlpatterns = [
         "horilla-history-revert/<int:pk>/<int:history_id>/",
         history.HorillaHistoryView.as_view(),
         name="history-revert",
+    ),
+    path(
+        "update-kanban-sequence/",
+        views.update_kanban_sequence,
+        name="update-kanban-sequence",
+    ),
+    path(
+        "update-kanban-item-group/",
+        views.update_kanban_item_group,
+        name="update-kanban-item-group",
+    ),
+    path(
+        "get-kanban-card-count/",
+        views.get_kanban_card_count,
+        name="get-kanban-card-count",
+    ),
+    path(
+        "update-kanban-group-sequence/",
+        views.update_kanban_group_sequence,
+        name="update-kanban-group-sequence",
+    ),
+    path(
+        "dynamic-path/<str:field>/<str:session_key>/",
+        views.DynamicView.as_view(),
+        name="dynamic-path",
+    ),
+    path("export-list-view/<slug:short_id>/", views.export_data, name="export-list"),
+    path(
+        "get-import-sheet/<uuid:view_id>/<str:session_key>/",
+        HorillaListView.serve_import_sheet,
+        name="get-import",
+    ),
+    path(
+        "post-import-sheet/<uuid:view_id>/<str:session_key>/",
+        HorillaListView.import_records,
+        name="post-import",
     ),
 ]

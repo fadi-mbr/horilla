@@ -17,15 +17,10 @@ class HorillaAutomationConfig(AppConfig):
 
     def ready(self) -> None:
         ready = super().ready()
-        if any(
-            cmd in sys.argv
-            for cmd in [
-                "makemigrations",
-                "migrate",
-                "compilemessages",
-                "flush",
-                "shell",
-            ]
+        if not (
+            len(sys.argv) >= 2
+            and sys.argv[1] == "runserver"
+            and os.environ.get("RUN_MAIN") == "true"
         ):
             return ready
         try:

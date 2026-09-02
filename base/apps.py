@@ -2,7 +2,8 @@
 This module contains the configuration for the 'base' app.
 """
 
-from django.apps import AppConfig
+from django.apps import AppConfig, apps
+from django.conf import settings
 
 
 class BaseConfig(AppConfig):
@@ -17,22 +18,14 @@ class BaseConfig(AppConfig):
         from base import signals
 
         super().ready()
-        try:
-            from base.models import EmployeeShiftDay
+        check_for_no_permissions_models()
 
-            if not EmployeeShiftDay.objects.exists():
-                days = [
-                    ("monday", "Monday"),
-                    ("tuesday", "Tuesday"),
-                    ("wednesday", "Wednesday"),
-                    ("thursday", "Thursday"),
-                    ("friday", "Friday"),
-                    ("saturday", "Saturday"),
-                    ("sunday", "Sunday"),
-                ]
 
-                EmployeeShiftDay.objects.bulk_create(
-                    [EmployeeShiftDay(day=day[0]) for day in days]
-                )
-        except Exception as e:
-            pass
+def check_for_no_permissions_models():
+
+    model_names = set()
+    for model in apps.get_models():
+        if getattr(model, "_no_permission_model", False):
+            model_names.add(model._meta.model_name)
+
+    settings.NO_PERMISSION_MODALS.extend(list(model_names))

@@ -1,0 +1,173 @@
+{% extends 'index.html' %}
+{% load static i18n horillafilters %}
+
+{% block content %}
+    <div>
+        {% include 'task/new/task_navbar.html' %}
+    </div>
+
+    {% include "generic/components.html" %}
+
+    <div class="oh-wrapper">
+        {% include "cbv/projects/project_details.html" %}
+
+        <div id="viewContainer" class="bg-white p-3 rounded-md shadow-card">
+            {% if view_type == 'list' %}
+                {% include 'task/new/task_list_view.html' %}
+            {% else %}
+                {% include 'task/new/task_kanban_view.html' %}
+            {% endif %}
+        </div>
+    </div>
+
+<div
+    class="oh-modal"
+    id="TaskModal"
+    role="dialog"
+    aria-labelledby="TaskModal"
+    aria-hidden="true"
+>
+    <div
+        class="oh-modal__dialog"
+        style="max-width: 550px"
+        id="TaskFormTarget"
+    ></div>
+</div>
+
+<div
+    class="oh-modal"
+    id="TaskUpdateModal"
+    role="dialog"
+    aria-labelledby="TaskUpdateModal"
+    aria-hidden="true"
+>
+    <div
+        class="oh-modal__dialog"
+        style="max-width: 550px"
+        id="TaskUpdateTarget"
+    ></div>
+</div>
+
+<div
+    class="oh-modal"
+    id="ProjectStageModal"
+    role="dialog"
+    aria-labelledby="TaskTimesheetModal"
+    aria-hidden="true"
+>
+    <div
+        class="oh-modal__dialog"
+        style="max-width: 550px"
+        id="ProjectStageFormTarget"
+    ></div>
+</div>
+
+<div
+    class="oh-modal"
+    id="TaskTimesheetModal"
+    role="dialog"
+    aria-labelledby="TaskTimesheetModal"
+    aria-hidden="true"
+>
+    <div
+        class="oh-modal__dialog"
+        style="max-width: 1350px"
+        id="TaskTimesheetTarget"
+    ></div>
+</div>
+
+<div
+    class="oh-modal {{request.GET.active}}"
+    id="TimesheetUpdateModal"
+    role="dialog"
+    aria-labelledby="TaskUpdateModal"
+    aria-hidden="true"
+>
+    <div
+        class="oh-modal__dialog"
+        style="max-width: 550px"
+        id="TimesheetUpdateTarget"
+    ></div>
+</div>
+
+<div
+    class="oh-modal"
+    id="addTimesheetModal"
+    role="dialog"
+    aria-labelledby="addTimesheetModal"
+    aria-hidden="true"
+    style="z-index: 1022"
+>
+    <div class="oh-modal__dialog" id="addTimesheetModalBody">
+        <!-- Modal hx content goes here -->
+    </div>
+</div>
+
+<script>
+
+    // list grid show hide
+
+    const tabs = document.querySelectorAll(".tab-btn");
+    const views = {
+        listBtn: document.getElementById("listView"),
+        gridBtn: document.getElementById("gridView"),
+    };
+
+    tabs.forEach((tab) => {
+        tab.addEventListener("click", () => {
+            // Remove active class from all tabs
+            tabs.forEach((btn) => btn.classList.remove("border-primary-600"));
+
+            // Add active to the clicked one
+            tab.classList.add("border-primary-600");
+
+            // Show related view
+            for (const key in views) {
+                views[key].classList.add("hidden");
+            }
+            views[tab.id].classList.remove("hidden");
+        });
+    });
+
+    // ACCORDION
+
+    document.querySelectorAll(".accordion-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            const panel = btn.nextElementSibling;
+            const icon = btn.querySelector(".icon");
+            const isOpen =
+                panel.style.maxHeight && panel.style.maxHeight !== "0px";
+
+            // Collapse all others (optional — comment this block if you want multiple open)
+            document.querySelectorAll(".accordion-panel").forEach((p) => {
+                p.style.maxHeight = null;
+                p.previousElementSibling.querySelector(".icon").textContent =
+                    "+";
+                p.previousElementSibling.classList.remove(
+                    "bg-[#e54f38]",
+                    "text-white"
+                );
+                p.previousElementSibling.classList.add(
+                    "bg-[#fff5f1]",
+                    "text-[#e54f38]"
+                );
+            });
+
+            // Toggle current
+            if (!isOpen) {
+                panel.style.maxHeight = panel.scrollHeight + "px";
+                icon.textContent = "−";
+                btn.classList.remove("bg-[#fff5f1]", "text-[#e54f38]");
+                btn.classList.add("bg-[#fff5f1]", "text-[#e54f38]");
+            } else {
+                panel.style.maxHeight = null;
+                icon.textContent = "+";
+                btn.classList.remove("bg-[#e54f38]", "text-white");
+                btn.classList.add("bg-[#fff5f1]", "text-[#e54f38]");
+            }
+        });
+    });
+
+</script>
+
+{% endblock content %}

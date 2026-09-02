@@ -1,0 +1,43 @@
+# Coolify-managed deployment compose for MBR Horilla 2.x (env-interpolated).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-horilla}
+      POSTGRES_USER: ${POSTGRES_USER:-horilla}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-horilla}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${POSTGRES_PASSWORD}"]
+    volumes:
+      - redisdata:/data
+  web:
+    build: .
+    environment:
+      DEBUG: "False"
+      SECRET_KEY: ${SECRET_KEY}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-people.mbrme.com,localhost,127.0.0.1}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-https://people.mbrme.com}
+      DATABASE_URL: postgres://${POSTGRES_USER:-horilla}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-horilla}
+      REDIS_URL: redis://:${POSTGRES_PASSWORD}@redis:6379/0
+      TIME_ZONE: ${TIME_ZONE:-Asia/Dubai}
+    ports:
+      - "127.0.0.1:8011:8000"
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - staticfiles:/app/staticfiles
+      - media:/app/media
+volumes:
+  pgdata:
+  redisdata:
+  staticfiles:
+  media:

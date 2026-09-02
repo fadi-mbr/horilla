@@ -73,7 +73,6 @@
 												<span class='d-flex justify-content-between align-items-center'
 												>
 													{{ticket.ticket_type.prefix}}{{ ticket.id|stringformat:"03d" }}
-													{% if ticket.status != "resolved" %}
 													<span title = 'due  {% if ticket.deadline == today %} today {% else %}in {{ticket.deadline|sub:today}}{% endif %}'>
 														<ion-icon
 															class="text-{% if ticket.deadline < today %}danger {% elif ticket.deadline == today %}warning {% else %}success{% endif %}"
@@ -81,7 +80,6 @@
 														>
 														</ion-icon>
 													</span>
-													{% endif %}
 												</span>
 											</div>
 											<div data-cell-index="1" class="oh-sticky-table__td">{{ticket.title}}</div>
@@ -401,7 +399,6 @@
 												<span class='d-flex justify-content-between align-items-center'
 												>
 													{{ticket.ticket_type.prefix}}{{ ticket.id|stringformat:"03d" }}
-													{% if ticket.status != "resolved" %}
 													<span title = 'due  {% if ticket.deadline == today %} today {% else %}in {{ticket.deadline|sub:today}}{% endif %}'>
 														<ion-icon
 															class="text-{% if ticket.deadline < today %}danger {% elif ticket.deadline == today %}warning {% else %}success{% endif %}"
@@ -409,7 +406,6 @@
 														>
 														</ion-icon>
 													</span>
-													{% endif %}
 												</span>
 											</div>
 											<div data-cell-index="11" class="oh-sticky-table__td">{{ticket.title}}</div>
@@ -787,7 +783,6 @@
 											<span class='d-flex justify-content-between align-items-center'
 											>
 												{{ticket.ticket_type.prefix}}{{ ticket.id|stringformat:"03d" }}
-												{% if ticket.status != "resolved" %}
 												<span title = 'due  {% if ticket.deadline == today %} today {% else %}in {{ticket.deadline|sub:today}}{% endif %}'>
 													<ion-icon
 														class="text-{% if ticket.deadline < today %}danger {% elif ticket.deadline == today %}warning {% else %}success{% endif %}"
@@ -795,7 +790,6 @@
 													>
 													</ion-icon>
 												</span>
-												{% endif %}
 											</span>
 										</div>
 										<div data-cell-index="21" class="oh-sticky-table__td">{{ticket.title}}</div>

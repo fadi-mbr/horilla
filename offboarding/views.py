@@ -4,7 +4,6 @@ from urllib.parse import parse_qs
 
 from django.apps import apps
 from django.contrib import messages
-from django.contrib.auth.models import User
 from django.core.paginator import Paginator
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
@@ -25,6 +24,7 @@ from horilla.decorators import (
 )
 from horilla.group_by import group_by_queryset as group_by
 from horilla.methods import get_horilla_model_class
+from horilla_auth.models import HorillaUser
 from notifications.signals import notify
 from offboarding.decorators import (
     any_manager_can_enter,
@@ -313,6 +313,39 @@ def create_stage(request):
 
 
 @login_required
+@offboarding_manager_can_enter("offboarding.change_offboardingstage")
+def update_stage_order(request, pk):
+    """
+    This method is used to update the stage sequence of the offboarding
+    """
+    offboarding = Offboarding.objects.get(id=pk)
+
+    if request.method == "POST":
+        try:
+            order = json.loads(request.POST.get("order", "[]"))
+            for index, stage_id in enumerate(order):
+                stage = offboarding.offboardingstage_set.get(id=stage_id)
+                stage.sequence = index + 1
+                stage.save()
+            messages.success(request, "Sequence Updated Successfully")
+            return JsonResponse({"status": "success"})
+        except Exception as e:
+            messages.error(request, "Error Updating Sequence..")
+            return JsonResponse({"status": "error", "message": str(e)}, status=400)
+
+    stages = offboarding.offboardingstage_set.order_by("sequence")
+
+    return render(
+        request,
+        "cbv/exit_process/stage_order.html",
+        {
+            "stages": stages,
+            "offboarding": offboarding,
+        },
+    )
+
+
+@login_required
 @any_manager_can_enter("offboarding.add_offboardingemployee")
 def add_employee(request):
     """
@@ -370,7 +403,7 @@ def delete_employee(request):
         messages.success(request, _("Offboarding employee deleted"))
         notify.send(
             request.user.employee_get,
-            recipient=User.objects.filter(
+            recipient=HorillaUser.objects.filter(
                 id__in=instances.values_list("employee_id__employee_user_id", flat=True)
             ),
             verb=f"You have been removed from the offboarding",
@@ -435,7 +468,7 @@ def change_stage(request):
     )
     notify.send(
         request.user.employee_get,
-        recipient=User.objects.filter(
+        recipient=HorillaUser.objects.filter(
             id__in=employees.values_list("employee_id__employee_user_id", flat=True)
         ),
         verb=f"Offboarding stage has been changed",
@@ -459,6 +492,51 @@ def change_stage(request):
             "today": datetime.today().date(),
         },
     )
+
+
+@login_required
+@hx_request_required
+@any_manager_can_enter("offboarding.change_offboarding")
+def change_offboarding_stage(request):
+    """
+    This method is used to update the stages of the employee
+    """
+    employee_ids = request.GET.getlist("employee_ids")
+    stage_id = request.GET["stage_id"]
+    employees = OffboardingEmployee.objects.filter(id__in=employee_ids)
+    stage = OffboardingStage.objects.get(id=stage_id)
+    # This wont trigger the save method inside the offboarding employee
+    # employees.update(stage_id=stage)
+    for employee in employees:
+        employee.stage_id = stage
+        employee.save()
+    if stage.type == "archived":
+        Employee.objects.filter(
+            id__in=employees.values_list("employee_id__id", flat=True)
+        ).update(is_active=False)
+    stage_forms = {}
+    stage_forms[str(stage.offboarding_id.id)] = StageSelectForm(
+        offboarding=stage.offboarding_id
+    )
+    notify.send(
+        request.user.employee_get,
+        recipient=HorillaUser.objects.filter(
+            id__in=employees.values_list("employee_id__employee_user_id", flat=True)
+        ),
+        verb=f"Offboarding stage has been changed",
+        verb_ar=f"تم تغيير مرحلة إنهاء الخدمة",
+        verb_de=f"Die Offboarding-Stufe wurde geändert",
+        verb_es=f"Se ha cambiado la etapa de offboarding",
+        verb_fr=f"L'étape d'offboarding a été changée",
+        redirect=reverse("offboarding-pipeline"),
+        icon="information",
+    )
+    groups = pipeline_grouper({}, [stage.offboarding_id])
+    for item in groups:
+        setattr(item["offboarding"], "stages", item["stages"])
+    from horilla_views.generic.cbv.views import HorillaFormView
+
+    return HorillaFormView.HttpResponse()
 
 
 @login_required
@@ -597,17 +675,18 @@ def update_task_status(request, *args, **kwargs):
     """
     This method is used to update the assigned tasks status
     """
-    stage_id = request.GET["stage_id"]
+    stage_id = request.GET.get("stage_id")
     employee_ids = request.GET.getlist("employee_ids")
-    task_id = request.GET["task_id"]
-    status = request.GET["task_status"]
+    task_id = request.GET.get("task_id")
+    status = request.GET.get("task_status")
     employee_task = EmployeeTask.objects.filter(
         employee_id__id__in=employee_ids, task_id__id=task_id
     )
     employee_task.update(status=status)
+    messages.success(request, _("Task status updated successfully..."))
     notify.send(
         request.user.employee_get,
-        recipient=User.objects.filter(
+        recipient=HorillaUser.objects.filter(
             id__in=employee_task.values_list(
                 "task_id__managers__employee_user_id", flat=True
             )
@@ -833,6 +912,20 @@ def search_resignation_request(request):
 
 
 @login_required
+@hx_request_required
+@check_feature_enabled("resignation_request")
+def resignation_tab(request, pk):
+
+    letters = ResignationLetter.objects.filter(employee_id=pk)
+    employee = Employee.objects.get(id=pk)
+    return render(
+        request,
+        "cbv/resignation/resignation_tab.html",
+        {"letters": letters, "employee": employee},
+    )
+
+
+@login_required
 @check_feature_enabled("resignation_request")
 def delete_resignation_request(request):
     """
@@ -846,7 +939,7 @@ def delete_resignation_request(request):
     ):
         return redirect("/employee/employee-profile/")
     else:
-        return redirect(request_view)
+        return redirect("resignation-request-view")
 
 
 @login_required
@@ -937,7 +1030,8 @@ def update_status(request):
                 redirect="#",
                 icon="information",
             )
-    return redirect(request_view)
+    # return redirect(request_view)
+    return redirect(reverse("resignation-request-view"))
 
 
 @login_required

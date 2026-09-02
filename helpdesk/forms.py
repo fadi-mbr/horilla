@@ -26,7 +26,6 @@ from typing import Any
 
 from django import forms
 from django.template.loader import render_to_string
-from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm
 from base.methods import filtersubordinatesemployeemodel, is_reportingmanager
@@ -47,6 +46,8 @@ from horilla import horilla_middlewares
 
 class TicketTypeForm(ModelForm):
 
+    cols = {"title": 12, "type": 12, "prefix": 12}
+
     class Meta:
         model = TicketType
         fields = "__all__"
@@ -62,25 +63,37 @@ class TicketTypeForm(ModelForm):
 
 
 class FAQForm(ModelForm):
+
+    cols = {"question": 12, "answer": 12, "tags": 12}
+
     class Meta:
         model = FAQ
         fields = "__all__"
         exclude = ["is_active"]
         widgets = {
             "category": forms.HiddenInput(),
+            "tags": forms.SelectMultiple(
+                attrs={
+                    "class": "oh-select oh-select-2 select2-hidden-accessible",
+                    "onchange": "updateTag(this)",
+                }
+            ),
         }
 
     def __init__(self, *args, **kwargs):
-        """Initializes the FAQ form instance and adjusts the tags field."""
+        """
+        Initializes the Ticket tag form instance.
+        If an instance is provided, sets the initial value for the form's .
+        """
         super().__init__(*args, **kwargs)
-
-        if "tags" in self.fields:
-            self.fields["tags"].choices = list(self.fields["tags"].choices)
-            self.fields["tags"].widget.attrs.update({"onchange": "updateTag(this)"})
-            self.fields["tags"].choices.append(("create_new_tag", "Create new tag"))
+        self.fields["tags"].choices = list(self.fields["tags"].choices)
+        self.fields["tags"].choices.append(("create_new_tag", "Create new tag"))
 
 
 class TicketForm(ModelForm):
+
+    cols = {"description": 12, "tags": 12}
+    deadline = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
 
     class Meta:
         model = Ticket
@@ -149,9 +162,9 @@ class TicketForm(ModelForm):
             self.fields["ticket_type"].choices = list(
                 self.fields["ticket_type"].choices
             )
-            self.fields["ticket_type"].choices.append(
-                ("create_new_ticket_type", "Create new ticket type")
-            )
+            # self.fields["ticket_type"].choices.append(
+            #     ("create_new_ticket_type", "Create new ticket type")
+            # )
         if is_reportingmanager(request) or request.user.has_perm("base.add_tags"):
             self.fields["tags"].choices = list(self.fields["tags"].choices)
             self.fields["tags"].choices.append(("create_new_tag", "Create new tag"))
@@ -187,6 +200,14 @@ class TicketTagForm(ModelForm):
         fields = [
             "tags",
         ]
+        widgets = {
+            "tags": forms.SelectMultiple(
+                attrs={
+                    "class": "oh-select oh-select-2 select2-hidden-accessible",
+                    "onchange": "updateTag()",
+                }
+            ),
+        }
 
     def __init__(self, *args, **kwargs):
         """
@@ -195,13 +216,7 @@ class TicketTagForm(ModelForm):
         """
         super().__init__(*args, **kwargs)
         request = getattr(horilla_middlewares._thread_locals, "request", None)
-
-        if (
-            request
-            and request.user.is_authenticated
-            and (is_reportingmanager(request) or request.user.has_perm("base.add_tags"))
-        ):
-            self.fields["tags"].widget.attrs.update({"onchange": "updateTag(this)"})
+        if is_reportingmanager(request) or request.user.has_perm("base.add_tags"):
             self.fields["tags"].choices = list(self.fields["tags"].choices)
             self.fields["tags"].choices.append(("create_new_tag", "Create new tag"))
 
@@ -226,6 +241,8 @@ class TicketAssigneesForm(ModelForm):
 
 
 class FAQCategoryForm(ModelForm):
+    cols = {"title": 12, "description": 12}
+
     class Meta:
         model = FAQCategory
         fields = "__all__"
@@ -262,6 +279,9 @@ class AttachmentForm(forms.ModelForm):
 
 
 class DepartmentManagerCreateForm(ModelForm):
+
+    cols = {"department": 12, "manager": 12}
+
     class Meta:
         model = DepartmentManager
         fields = ["department", "manager"]
@@ -275,11 +295,14 @@ class DepartmentManagerCreateForm(ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if "instance" in kwargs:
-            department = kwargs["instance"].department
-            # Get the employees related to this department
-            employees = department.employeeworkinformation_set.values_list(
-                "employee_id", flat=True
-            )
-            # Set the manager field queryset to be those employees
-            self.fields["manager"].queryset = Employee.objects.filter(id__in=employees)
+        if self.instance.pk:
+            if "instance" in kwargs:
+                department = kwargs["instance"].department
+                # Get the employees related to this department
+                employees = department.employeeworkinformation_set.values_list(
+                    "employee_id", flat=True
+                )
+                # Set the manager field queryset to be those employees
+                self.fields["manager"].queryset = Employee.objects.filter(
+                    id__in=employees
+                )

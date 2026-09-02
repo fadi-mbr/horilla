@@ -1,6 +1,5 @@
 from django import forms
 from django.template.loader import render_to_string
-from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm
 from base.methods import reload_queryset
@@ -45,7 +44,7 @@ class DocumentRequestForm(ModelForm):
                 required=True,
                 instance=self.instance,
             ),
-            label=_("Employee"),
+            label="Employee",
         )
         reload_queryset(self.fields)
 
@@ -75,21 +74,29 @@ class DocumentForm(ModelForm):
         table_html = render_to_string("common_form.html", context)
         return table_html
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["expiry_date"].widget.attrs.update(
+            {
+                "hx-target": "#id_notify_before_parent_div",
+                "hx-trigger": "load,change",
+                "hx-swap": "innerHTML",
+                "hx-get": "/employee/get-notify-field/",
+            }
+        )
+
 
 class DocumentUpdateForm(ModelForm):
     """form to Update a Document"""
 
+    cols = {"document": 12}
+
+    verbose_name = "Document"
+
     class Meta:
         model = Document
         fields = "__all__"
-        exclude = [
-            "title",
-            "document_request_id",
-            "status",
-            "created_by",
-            "modified_by",
-            "employee_id",
-        ]
+        exclude = ["is_active"]
         widgets = {
             "issue_date": forms.DateInput(
                 attrs={"type": "date", "class": "oh-input  w-100"}
@@ -98,6 +105,20 @@ class DocumentUpdateForm(ModelForm):
                 attrs={"type": "date", "class": "oh-input  w-100"}
             ),
         }
+
+
+class DocumentRejectCbvForm(ModelForm):
+    """form to add rejection reason while rejecting a Document"""
+
+    cols = {"reject_reason": 12}
+
+    class Meta:
+        model = Document
+        fields = ["reject_reason"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["reject_reason"].widget.attrs["required"] = True
 
 
 class DocumentRejectForm(ModelForm):

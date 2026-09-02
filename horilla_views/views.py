@@ -1,24 +1,41 @@
 import importlib
+import io
+import json
+import re
 from collections import defaultdict
 
+from bs4 import BeautifulSoup
 from django import forms
 from django.apps import apps
 from django.contrib import messages
 from django.contrib.admin.utils import NestedObjects
 from django.core.cache import cache as CACHE
 from django.db import router
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_protect
+from import_export import fields, resources
+from xhtml2pdf import pisa
 
 from base.methods import eval_validate
+from horilla.decorators import login_required as func_login_required
+from horilla.horilla_middlewares import _thread_locals
 from horilla.signals import post_generic_delete, pre_generic_delete
 from horilla_views import models
-from horilla_views.cbv_methods import get_short_uuid, login_required, merge_dicts
+from horilla_views.cbv_methods import (
+    export_xlsx,
+    get_nested_field,
+    get_short_uuid,
+    login_required,
+    merge_dicts,
+    render_to_string,
+    set_nested_attr,
+)
 from horilla_views.forms import SavedFilterForm
 from horilla_views.generic.cbv.views import HorillaFormView, HorillaListView
+from horilla_views.templatetags.generic_template_filters import getattribute
 
 # Create your views here.
 
@@ -592,3 +609,506 @@ class HorillaDeleteConfirmationView(View):
         context = {}
         context["confirmation_target"] = self.confirmation_target
         return context
+
+
+def update_kanban_sequence(request):
+    """
+    generic method to update the 'sequence' in kanban view.
+
+    GET params:
+    - model: 'app_label.ModelName'
+    - order: list of IDs (in the desired order)
+    - groupKey: optional grouping field (e.g., stage_id)
+    - groupId: optional value of the grouping field
+    """
+
+    model_path = request.GET.get("model", "")
+    order = request.GET.get("order")
+    group_key = request.GET.get("groupKey")
+    group_id = request.GET.get("groupId")
+    order_list = json.loads(order)
+    order_by = request.GET.get("orderBy")
+
+    if not model_path:
+        return JsonResponse({"error": "Missing 'model' or 'order'."}, status=400)
+    if not order_list:
+        return JsonResponse({})
+    try:
+        app_label, model_name = model_path.split(".")
+        model = apps.get_model(app_label, model_name)
+    except Exception:
+        return JsonResponse({"error": "Invalid model path."}, status=400)
+
+    if not get_nested_field(model, order_by):
+        return JsonResponse({"info": f"Model does not have a {order_by} field."})
+
+    filters = {}
+    if group_key and group_id:
+        if not get_nested_field(model, group_key):
+            return JsonResponse(
+                {"error": f"Model does not have field '{group_key}'."}, status=400
+            )
+
+        field = get_nested_field(model, group_key)
+        if field.is_relation:
+            try:
+                group_instance = field.related_model.objects.get(pk=group_id)
+            except field.related_model.DoesNotExist:
+                return JsonResponse(
+                    {
+                        "error": f"{field.related_model.__name__} with ID {group_id} not found."
+                    },
+                    status=404,
+                )
+            filters[group_key] = group_instance
+        else:
+            filters[group_key] = group_id
+
+    objs = list(model.objects.filter(id__in=order_list, **filters))
+    obj_by_id = {str(obj.id): obj for obj in objs}
+
+    updated_objs = []
+    for index, obj_id in enumerate(order_list):
+        obj = obj_by_id.get(str(obj_id))
+        if obj:
+            set_nested_attr(obj, order_by, index)
+            updated_objs.append(obj)
+
+    if updated_objs and "__" not in order_by:
+        model.objects.bulk_update(updated_objs, [order_by])
+
+    return JsonResponse({"status": "success", "updated": len(updated_objs)})
+
+
+def update_kanban_item_group(request):
+    """
+    Generic method to update sequence and group kanban objects.
+
+    GET parameters:
+    - model: 'app_label.ModelName'
+    - groupKey: foreign key field on the model (can be nested: 'stage__stage_id')
+    - groupId: ID of the new group to assign
+    - objectId: ID of the object being moved
+    - order: ordered list of IDs to update sequence
+    """
+
+    model_path = request.GET.get("model")
+    group_key = request.GET.get("groupKey")
+    group_id = request.GET.get("groupId")
+    object_id = request.GET.get("objectId")
+    order = request.GET.get("order")
+    order_by = request.GET.get("orderBy")
+    order_list = json.loads(order)
+
+    if not all([model_path, group_key, group_id, object_id, order_list]):
+        return JsonResponse({"error": "Missing required parameters"}, status=400)
+
+    try:
+        model = apps.get_model(*model_path.split("."))
+
+        # Get the group object from group_key
+        group_field = get_nested_field(model, group_key)
+        if hasattr(group_field, "related_model") and group_field.related_model:
+            group_model = group_field.related_model
+            group_instance = group_model.objects.get(id=group_id)
+        else:
+            # Not a ForeignKey → probably a CharField (choices) or something similar
+            group_instance = group_id
+
+        # Fetch all objects in order_list
+        objects = list(model.objects.filter(id__in=order_list))
+        obj_map = {str(obj.id): obj for obj in objects}
+        updated = []
+        fields = set()
+
+        for index, obj_id in enumerate(order_list):
+            obj = obj_map.get(str(obj_id))
+            if not obj:
+                continue
+
+            set_nested_attr(obj, order_by, index)
+
+            # If group_key is nested, set it properly
+            if "__" in group_key:
+                set_nested_attr(obj, group_key, group_instance)
+            else:
+                setattr(obj, group_key, group_instance)
+
+            updated.append(obj)
+
+        if "__" not in group_key:
+            fields.add(group_key)
+
+        if fields:
+            model.objects.bulk_update(updated, list(fields))
+
+        return JsonResponse({"status": "success", "updated": len(updated)})
+
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+def update_kanban_group_sequence(request):
+    """
+    Generic method to update the sequence of kanban groups.
+    """
+    model_path = request.GET.get("model")
+    group_key = request.GET.get("group_key")
+    sequence_raw = request.GET.get("sequence", "")
+    order_by = request.GET.get("orderBy")
+
+    try:
+        sequence = json.loads(sequence_raw)
+    except json.JSONDecodeError:
+        sequence = []
+
+    model = apps.get_model(*model_path.split("."))
+    group_field = get_nested_field(model, group_key)
+
+    group_model = group_field.related_model
+
+    to_update = []
+    for index, group_id in enumerate(sequence):
+        instance = group_model(
+            pk=group_id,
+            sequence=index,
+        )
+        to_update.append(instance)
+
+    group_model.objects.bulk_update(to_update, fields=[order_by])
+
+    return JsonResponse(
+        {"status": "success", "message": "Group sequence updated successfully."}
+    )
+
+
+def get_kanban_card_count(request):
+    """
+    Generic method to get the count of kanban cards in each group.
+    """
+    model_path = request.GET.get("model")
+    group_id = request.GET.get("group_id")
+    group_key = request.GET.get("group_key")
+
+    model = apps.get_model(*model_path.split("."))
+    count = model.objects.filter(**{group_key: group_id}).count()
+
+    return HttpResponse(f"{count}")
+
+
+_getattibute = getattribute
+
+
+def sanitize_filename(filename):
+    return re.sub(r'[<>:"/\\|?*\[\]]+', "_", filename)[:200]  # limit to 200 chars
+
+
+def get_model_class(model_path):
+    """
+    method to return the model class from string 'app.models.Model'
+    """
+    module_name, class_name = model_path.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[class_name])
+    model_class = getattr(module, class_name)
+    return model_class
+
+
+import os
+
+from django.conf import settings
+from django.contrib.staticfiles import finders
+from django.templatetags.static import static
+
+
+def link_callback(uri, rel):
+    """
+    Convert html URIs to absolute system paths so xhtml2pdf can access them.
+    Called by pisa.CreatePDF(..., link_callback=link_callback)
+    """
+    # If absolute URL (http/https/file) return as-is
+    if (
+        uri.startswith("http://")
+        or uri.startswith("https://")
+        or uri.startswith("file://")
+    ):
+        return uri
+
+    # Try static files first
+    static_path = None
+    if uri.startswith(settings.STATIC_URL):
+        # remove STATIC_URL prefix
+        rel_path = uri.replace(settings.STATIC_URL, "")
+        # find with staticfiles finders
+        found = finders.find(rel_path)
+        if found:
+            static_path = found
+
+    # Try media files next
+    media_path = None
+    if uri.startswith(settings.MEDIA_URL):
+        rel_path = uri.replace(settings.MEDIA_URL, "")
+        media_path = os.path.join(settings.MEDIA_ROOT, rel_path)
+
+    # If a path found, return it
+    for path in (static_path, media_path, uri):
+        if path and os.path.exists(path):
+            return path
+
+    # Last resort: maybe it's relative to your project root
+    project_path = os.path.join(settings.BASE_DIR, uri)
+    if os.path.exists(project_path):
+        return project_path
+
+    raise Exception("File not found for URI: %s" % uri)
+
+
+@func_login_required
+def export_data(request, *args, **kwargs):
+    """
+    Export list view visible columns
+    """
+    from horilla_views.generic.cbv.views import HorillaFormView
+
+    request = getattr(_thread_locals, "request", None)
+    _raw_ids = request.POST.get("ids") or ""
+    ids = eval_validate(_raw_ids) if str(_raw_ids).strip() else []
+    _columns = eval_validate(request.POST["columns"])
+    export_format = request.POST.get("format", "xlsx")
+
+    model: models.models.Model = get_model_class(model_path=request.GET["model"])
+
+    if not request.user.has_perm(
+        f"""{request.GET["model"].split(".")[0]}.view_{model.__name__}"""
+    ):
+        messages.info(f"You dont have view perm for model {model._meta.verbose_name}")
+        return HorillaFormView.HttpResponse()
+    # Empty selection (no rows ticked) sends ids="" -> export all rows of the
+    # view's model instead of crashing into the generic error page.
+    queryset = model.objects.filter(id__in=ids) if ids else model.objects.all()
+    export_fields = eval_validate(request.POST.get("export_fields") or "[]")
+    export_file_name = request.POST.get("export_file_name") or "quick_export"
+    export_file_name = sanitize_filename(export_file_name)
+
+    _model = model
+
+    class HorillaListViewResorce(resources.ModelResource):
+        """
+        Instant Resource class
+        """
+
+        id = fields.Field(column_name="ID")
+
+        class Meta:
+            """
+            Meta class for additional option
+            """
+
+            model = _model
+            fields = [field[1] for field in _columns]  # 773
+
+        def dehydrate_id(self, instance):
+            """
+            Dehydrate method for id field
+            """
+            return instance.pk
+
+        for field_tuple in _columns:
+            dynamic_fn_str = f"def dehydrate_{field_tuple[1]}(self, instance):return self.remove_extra_spaces(getattribute(instance, '{field_tuple[1]}'),{field_tuple})"
+            exec(dynamic_fn_str)
+            dynamic_fn = locals()[f"dehydrate_{field_tuple[1]}"]
+            locals()[field_tuple[1]] = fields.Field(column_name=field_tuple[0])
+
+        def remove_extra_spaces(self, text, field_tuple):
+            """
+            Clean the text:
+            - If it's a <select> element, extract the selected option's value.
+            - If it's an <input> or <textarea>, extract its 'value'.
+            - Otherwise, remove blank spaces, keep line breaks, and handle <li> tags.
+            """
+            soup = BeautifulSoup(str(text), "html.parser")
+
+            # Handle <select> tag
+            select_tag = soup.find("select")
+            if select_tag:
+                selected_option = select_tag.find("option", selected=True)
+                if selected_option:
+                    return selected_option["value"]
+                else:
+                    first_option = select_tag.find("option")
+                    return first_option["value"] if first_option else ""
+
+            # Handle <input> tag
+            input_tag = soup.find("input")
+            if input_tag:
+                return input_tag.get("value", "")
+
+            # Handle <textarea> tag
+            textarea_tag = soup.find("textarea")
+            if textarea_tag:
+                return textarea_tag.text.strip()
+
+            # Default: clean normal text and <li> handling
+            for li in soup.find_all("li"):
+                li.insert_before("\n")
+                li.unwrap()
+
+            text = soup.get_text()
+            lines = text.splitlines()
+            non_blank_lines = [line.strip() for line in lines if line.strip()]
+            cleaned_text = "\n".join(non_blank_lines)
+            return cleaned_text
+
+    book_resource = HorillaListViewResorce()
+
+    # Export the data using the resource
+    dataset = book_resource.export(queryset)
+
+    # excel_data = dataset.export("xls")
+
+    # Set the response headers
+    # file_name = self.export_file_name
+    # if not file_name:
+    #     file_name = "quick_export"
+    # response = HttpResponse(excel_data, content_type="application/vnd.ms-excel")
+    # response["Content-Disposition"] = f'attachment; filename="{file_name}.xls"'
+    # return response
+
+    json_data = json.loads(dataset.export("json"))
+    merged = []
+
+    for item in _columns:
+        # Check if item has exactly 2 elements
+        if len(item) == 2:
+            # Check if there's a matching (type, key) in export_fields (t, k, _)
+            match_found = any(
+                export_item[0] == item[0] and export_item[1] == item[1]
+                for export_item in export_fields
+            )
+
+            if match_found:
+                # Find the first matching metadata or use {} as fallback
+                try:
+                    metadata = next(
+                        (
+                            export_item[2]
+                            for export_item in export_fields
+                            if export_item[0] == item[0] and export_item[1] == item[1]
+                        ),
+                        {},
+                    )
+                except Exception as e:
+                    merged.append(item)
+                    continue
+
+                merged.append([*item, metadata])
+            else:
+                merged.append(item)
+        else:
+            merged.append(item)
+    columns = []
+    for column in merged:
+        if len(column) >= 3 and isinstance(column[2], dict):
+            column = (column[0], column[0], column[2])
+        elif len(column) >= 3:
+            column = (column[0], column[1])
+        columns.append(column)
+
+    logo_path = ""
+    company_title = ""
+
+    company = request.selected_company_instance
+    if company:
+        logo_path = company.icon
+        company_title = company.company
+
+    if export_format == "json":
+        response = HttpResponse(
+            json.dumps(json_data, indent=4), content_type="application/json"
+        )
+        response["Content-Disposition"] = (
+            f'attachment; filename="{export_file_name}.json"'
+        )
+        return response
+    # CSV
+    elif export_format == "csv":
+        csv_data = dataset.export("csv")
+        response = HttpResponse(csv_data, content_type="text/csv")
+        response["Content-Disposition"] = (
+            f'attachment; filename="{export_file_name}.csv"'
+        )
+        return response
+    elif export_format == "pdf":
+
+        headers = dataset.headers
+        rows = dataset.dict
+        if not logo_path:
+            logo_path = static(os.path.join(settings.BASE_DIR, logo_path))
+
+        # Get absolute logo path from ImageField or fallback
+        if logo_path:
+            # If it's a FieldFile (from ImageField), convert to string
+            if hasattr(logo_path, "path"):
+                abs_logo_path = logo_path.path  # full file system path
+            else:
+                abs_logo_path = os.path.join(settings.BASE_DIR, str(logo_path))
+        else:
+            abs_logo_path = None
+        # Render to HTML using a template
+        landscape = len(headers) > 5
+        html_string = render_to_string(
+            "generic/export_pdf.html",
+            {
+                "headers": headers,
+                "rows": rows,
+                "landscape": landscape,
+                "company_name": company_title,
+                "date_range": (
+                    request.session.get("report_date_range")
+                    if request.session.get("report_date_range")
+                    else ""
+                ),
+                "report_title": export_file_name,
+                "logo_path": abs_logo_path,
+            },
+        )
+
+        # Convert HTML to PDF using xhtml2pdf
+        result = io.BytesIO()
+        pisa_status = pisa.CreatePDF(
+            html_string, dest=result, link_callback=link_callback
+        )
+
+        if pisa_status.err:
+            return HttpResponse("PDF generation failed", status=500)
+
+        # Return response
+        response = HttpResponse(result.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = (
+            f'attachment; filename="{export_file_name}.pdf"'
+        )
+        return response
+
+    return export_xlsx(
+        json_data,
+        columns,
+        file_name=export_file_name,
+        extra_info={
+            "company_name": company_title,
+            "date_range": request.session.get("report_date_range"),
+            "report_title": export_file_name,
+            "logo_path": logo_path,
+        },
+    )
+
+
+class DynamicView(View):
+    """
+    DynamicView
+    """
+
+    def get(self, request, field, session_key):
+        if session_key != request.session.session_key:
+            return HttpResponseForbidden("Invalid session key.")
+
+        # Your logic here
+        return render(request, "dynamic.html", {"field": field})

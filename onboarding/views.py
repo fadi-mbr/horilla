@@ -22,7 +22,6 @@ from urllib.parse import parse_qs
 from django import template
 from django.contrib import messages
 from django.contrib.auth import login
-from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
 from django.core.mail import EmailMessage, send_mail
 from django.core.paginator import Paginator
@@ -54,6 +53,7 @@ from horilla.decorators import (
     permission_required,
 )
 from horilla.group_by import group_by_queryset as general_group_by
+from horilla_auth.models import HorillaUser
 from horilla_documents.models import Document
 from notifications.signals import notify
 from onboarding.decorators import (
@@ -200,6 +200,39 @@ def stage_update(request, stage_id, recruitment_id):
         request,
         "onboarding/stage_update.html",
         {"form": form, "stage_id": stage_id, "recruitment_id": recruitment_id},
+    )
+
+
+@login_required
+@recruitment_manager_can_enter("onboarding.change_onboardingstage")
+def update_stage_order(request, pk):
+    """
+    This method is used to update the stage sequence of the onboarding
+    """
+    recruitment = Recruitment.objects.get(id=pk)
+
+    if request.method == "POST":
+        try:
+            order = json.loads(request.POST.get("order", "[]"))
+            for index, stage_id in enumerate(order):
+                stage = recruitment.onboarding_stage.get(id=stage_id)
+                stage.sequence = index + 1
+                stage.save()
+            messages.success(request, "Sequence Updated Successfully")
+            return JsonResponse({"status": "success"})
+        except Exception as e:
+            messages.error(request, "Error Updating Sequence..")
+            return JsonResponse({"status": "error", "message": str(e)}, status=400)
+
+    stages = recruitment.onboarding_stage.order_by("sequence")
+
+    return render(
+        request,
+        "cbv/pipeline/onboarding/stage_order.html",
+        {
+            "stages": stages,
+            "recruitment": recruitment,
+        },
     )
 
 
@@ -454,7 +487,7 @@ def candidate_delete(request, obj_id):
                 )
             ),
         )
-    return redirect(candidates_view)
+    return redirect(reverse("candidates-view"))
 
 
 @login_required
@@ -929,7 +962,7 @@ def user_creation(request, token):
         if onboarding_portal.count == 3:
             return redirect("employee-bank-details", token)
         candidate = onboarding_portal.candidate_id
-        user = User.objects.filter(username=candidate.email).first()
+        user = HorillaUser.objects.filter(username=candidate.email).first()
         form = UserCreationForm(instance=user)
         try:
             if request.method == "POST":
@@ -1117,7 +1150,9 @@ def employee_bank_details(request, token):
     POST : return employee_bank_details_save function
     """
     onboarding_portal = OnboardingPortal.objects.get(token=token)
-    user = User.objects.filter(username=onboarding_portal.candidate_id.email).first()
+    user = HorillaUser.objects.filter(
+        username=onboarding_portal.candidate_id.email
+    ).first()
     employee = Employee.objects.filter(employee_user_id=user).first()
     bank_info = EmployeeBankDetails.objects.filter(employee_id=employee).first()
     form = BankDetailsCreationForm(instance=bank_info)
@@ -1741,7 +1776,11 @@ def change_task_status(request):
     ]:
         candidate_task.status = status
         candidate_task.save()
-    return HttpResponse("Success")
+        messages.success(request, _("Task status updated successfully."))
+
+    return HttpResponse(
+        "<script>$('#reloadMessagesButton').click(); $('#myOnboardingReload').click(); </script>"
+    )
 
 
 @login_required
@@ -1800,25 +1839,6 @@ def add_to_rejected_candidates(request):
             messages.success(request, "Candidate reject reason saved")
             return HttpResponse("<script>window.location.reload()</script>")
     return render(request, "onboarding/rejection/form.html", {"form": form})
-
-
-@login_required
-@hx_request_required
-@permission_required("recruitment.delete_rejectedcandidate")
-def delete_candidate_rejection(request, rej_id):
-    """
-    This method is used to delete candidate rejection
-    """
-    try:
-        instance = RejectedCandidate.objects.filter(id=rej_id).first()
-        if instance:
-            instance.delete()
-            messages.success(request, "Candidate rejection deleted successfully")
-        else:
-            messages.error(request, "Candidate rejection not found")
-    except Exception as e:
-        messages.error(request, "Error occurred while deleting candidate rejection")
-    return HttpResponse("<script>window.location.reload()</script>")
 
 
 @login_required

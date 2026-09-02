@@ -10,7 +10,6 @@ from typing import Any
 
 from django import forms
 from django.apps import apps
-from django.contrib.admin.widgets import RelatedFieldWidgetWrapper
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.forms.widgets import TextInput
@@ -19,10 +18,13 @@ from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm as BaseModelForm
 from base.methods import filtersubordinatesemployeemodel, reload_queryset
+from base.models import CompanyLeaves, Holidays
 from employee.filters import EmployeeFilter
 from employee.forms import MultipleFileField
 from employee.models import Employee
 from horilla import horilla_middlewares
+from horilla.horilla_middlewares import _thread_locals
+from horilla_views.generic.cbv.views import HorillaFormView
 from horilla_widgets.forms import HorillaForm, HorillaModelForm
 from horilla_widgets.widgets.horilla_multi_select_field import HorillaMultiSelectField
 from horilla_widgets.widgets.select_widgets import HorillaMultiSelectWidget
@@ -53,11 +55,9 @@ class ConditionForm(forms.ModelForm):
                 field.widget.attrs["style"] = (
                     "width:100%; height:50px;border: 1px solid hsl(213deg,22%,84%);border-radius: 0rem;padding: 0.8rem 1.25rem;"
                 )
-            elif isinstance(widget, forms.DateInput):
-                field.initial = date.today
-                widget.input_type = "date"
-                widget.format = "%Y-%m-%d"
-                field.input_formats = ["%Y-%m-%d"]
+            elif isinstance(widget, (forms.DateInput)):
+                field.widget.attrs.update({"class": "oh-input w-100"})
+                field.initial = date.today()
 
             elif isinstance(
                 widget, (forms.NumberInput, forms.EmailInput, forms.TextInput)
@@ -134,6 +134,7 @@ class LeaveTypeForm(ConditionForm):
             "color": TextInput(attrs={"type": "color", "style": "height:40px;"}),
             "period_in": forms.HiddenInput(),
             "total_days": forms.HiddenInput(),
+            "carryforward_expire_date": forms.DateInput(attrs={"type": "date"}),
         }
 
     def clean(self):
@@ -197,6 +198,7 @@ class UpdateLeaveTypeForm(ConditionForm):
             "color": TextInput(attrs={"type": "color", "style": "height:40px;"}),
             "period_in": forms.HiddenInput(),
             "total_days": forms.HiddenInput(),
+            "carryforward_expire_date": forms.DateInput(attrs={"type": "date"}),
         }
 
     def clean(self):
@@ -217,34 +219,48 @@ class UpdateLeaveTypeForm(ConditionForm):
 
 
 class LeaveRequestCreationForm(BaseModelForm):
+    cols = {"description": 12}
+    start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
+    end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
 
     def __init__(self, *args, **kwargs):
 
         super().__init__(*args, **kwargs)
         self.fields["attachment"].widget.attrs["accept"] = ".jpg, .jpeg, .png, .pdf"
+        request = getattr(_thread_locals, "request")
+
+        # self.fields["start_date"].widget.attrs.update(
+        #     {
+        #         "onchange": "dateChange($(this))",
+        #     }
+        # )
+
         self.fields["leave_type_id"].widget.attrs.update(
             {
-                "hx-include": "#leaveRequestCreateForm",
-                "hx-target": "#availableLeaveCount",
-                "hx-swap": "outerHTML",
+                "hx-include": "#leaverequestForm",
+                "hx-target": "#createTitle",
+                "hx-swap": "afterend",
                 "hx-trigger": "change",
-                "hx-get": "/leave/employee-available-leave-count",
+                "hx-get": f"/leave/employee-available-leave-count",
             }
         )
+
         self.fields["employee_id"].widget.attrs.update(
             {
                 "hx-target": "#id_leave_type_id_parent_div",
                 "hx-trigger": "change",
+                "hx-swap": "innerHTML",
                 "hx-get": "/leave/get-employee-leave-types?form=LeaveRequestCreationForm",
             }
         )
+
         self.fields["start_date"].widget.attrs.update(
             {
-                "hx-include": "#leaveRequestCreateForm",
-                "hx-target": "#availableLeaveCount",
-                "hx-swap": "outerHTML",
+                "hx-include": "#leaverequestForm",
+                "hx-target": "#createTitle",
+                "hx-swap": "afterend",
                 "hx-trigger": "change",
-                "hx-get": "/leave/employee-available-leave-count",
+                "hx-get": f"/leave/employee-available-leave-count",
             }
         )
 
@@ -271,6 +287,8 @@ class LeaveRequestCreationForm(BaseModelForm):
 
 
 class LeaveRequestUpdationForm(BaseModelForm):
+    start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
+    end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
 
     def __init__(self, *args, **kwargs):
 
@@ -381,6 +399,8 @@ class LeaveOneAssignForm(HorillaModelForm):
         - employee_id: A HorillaMultiSelectField representing the employee to assign leave to.
     """
 
+    cols = {"employee_id": 12}
+
     employee_id = HorillaMultiSelectField(
         queryset=Employee.objects.all(),
         widget=HorillaMultiSelectWidget(
@@ -428,7 +448,35 @@ class AvailableLeaveUpdateForm(BaseModelForm):
         fields = ["available_days", "carryforward_days", "is_active"]
 
 
+class CompanyLeaveForm(BaseModelForm):
+    """
+    Form for managing company leave data.
+
+    This form allows users to manage company leave data by including all fields from
+    the CompanyLeaves model except for is_active.
+
+    Attributes:
+        - Meta: Inner class defining metadata options.
+            - model: The model associated with the form (CompanyLeaves).
+            - fields: A special value indicating all fields should be included in the form.
+            - exclude: A list of fields to exclude from the form (is_active).
+    """
+
+    cols = {"based_on_week": 12, "based_on_week_day": 12}
+
+    class Meta:
+        """
+        Meta class for additional options
+        """
+
+        model = CompanyLeaves
+        fields = "__all__"
+        exclude = ["is_active"]
+
+
 class UserLeaveRequestForm(BaseModelForm):
+    start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
+    end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
     description = forms.CharField(label=_("Description"), widget=forms.Textarea)
 
     def __init__(self, *args, **kwargs):
@@ -548,6 +596,9 @@ class RejectForm(forms.Form):
 
 
 class UserLeaveRequestCreationForm(BaseModelForm):
+    cols = {"description": 12}
+    start_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
+    end_date = forms.DateField(widget=forms.DateInput(attrs={"type": "date"}))
 
     def as_p(self, *args, **kwargs):
         """
@@ -567,11 +618,12 @@ class UserLeaveRequestCreationForm(BaseModelForm):
                 id__in=available_leaves.values_list("leave_type_id", flat=True)
             )
             self.fields["leave_type_id"].queryset = assigned_leave_types
+
         self.fields["leave_type_id"].widget.attrs.update(
             {
-                "hx-include": "#userLeaveForm",
-                "hx-target": "#availableLeaveCount",
-                "hx-swap": "outerHTML",
+                "hx-include": "#myleaverequestForm",
+                "hx-target": "#createTitle",
+                "hx-swap": "afterend",
                 "hx-trigger": "change",
                 "hx-get": f"/leave/employee-available-leave-count",
             }
@@ -612,6 +664,8 @@ class LeaveAllocationRequestForm(BaseModelForm):
         - as_p: Render the form fields as HTML table rows with Bootstrap styling.
     """
 
+    cols = {"description": 12}
+
     def as_p(self, *args, **kwargs):
         """
         Render the form fields as HTML table rows with Bootstrap styling.
@@ -630,8 +684,8 @@ class LeaveAllocationRequestForm(BaseModelForm):
             "leave_type_id",
             "employee_id",
             "requested_days",
-            "description",
             "attachment",
+            "description",
         ]
 
 
@@ -707,7 +761,7 @@ class AssignLeaveForm(HorillaForm):
             attrs={"class": "oh-select oh-select-2 mb-2", "required": True}
         ),
         empty_label=None,
-        label=_("Leave Type"),
+        label="Leave Type",
         required=False,
     )
     employee_id = HorillaMultiSelectField(
@@ -719,7 +773,7 @@ class AssignLeaveForm(HorillaForm):
             filter_template_path="employee_filters.html",
             required=True,
         ),
-        label=_("Employee"),
+        label="Employee",
     )
 
     def clean(self):
@@ -865,6 +919,15 @@ class LeaveAllocationCommentForm(BaseModelForm):
 
 
 class RestrictLeaveForm(BaseModelForm):
+
+    cols = {"title": 12, "description": 12}
+    start_date = forms.DateField(
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    end_date = forms.DateField(
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+
     def clean_end_date(self):
         start_date = self.cleaned_data.get("start_date")
         end_date = self.cleaned_data.get("end_date")
@@ -884,6 +947,12 @@ class RestrictLeaveForm(BaseModelForm):
     def __init__(self, *args, **kwargs):
         super(RestrictLeaveForm, self).__init__(*args, **kwargs)
         self.fields["title"].widget.attrs["autocomplete"] = "title"
+        self.fields["start_date"].widget = forms.DateInput(
+            attrs={"type": "date", "class": "oh-input w-100"}
+        )
+        self.fields["end_date"].widget = forms.DateInput(
+            attrs={"type": "date", "class": "oh-input w-100"}
+        )
         self.fields["department"].widget.attrs.update(
             {
                 "hx-include": "#leaveRestrictForm",
@@ -907,6 +976,12 @@ if apps.is_installed("attendance"):
         Methods:
             - as_p: Render the form fields as HTML table rows with Bootstrap styling.
         """
+
+        cols = {
+            "attendance_id": 12,
+            "description": 12,
+            "employee_id": 12,
+        }
 
         class Meta:
             """
@@ -954,8 +1029,9 @@ if apps.is_installed("attendance"):
             self.fields["employee_id"].queryset = queryset
             self.fields["employee_id"].widget.attrs.update(
                 {
-                    "hx-target": "#id_attendance_id_parent_div",
+                    "hx-target": "#dynamic_field_attendance_id",
                     "hx-trigger": "change",
+                    "hx-swap": "innerHTML",
                     "hx-get": "/leave/get-leave-attendance-dates",
                 }
             )

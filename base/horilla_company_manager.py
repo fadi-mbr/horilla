@@ -9,13 +9,21 @@ from django.db import models
 from django.db.models.query import QuerySet
 
 from horilla.horilla_middlewares import _thread_locals
-from horilla.signals import post_bulk_update, pre_bulk_update
+from horilla.signals import (
+    post_bulk_update,
+    post_model_clean,
+    pre_bulk_update,
+    pre_model_clean,
+)
 
 logger = logging.getLogger(__name__)
 django_filter_update = QuerySet.update
 
 
 def update(self, *args, **kwargs):
+    """
+    Bulk Update
+    """
     # pre_update signal
     request = getattr(_thread_locals, "request", None)
     self.request = request
@@ -26,6 +34,21 @@ def update(self, *args, **kwargs):
 
     return result
 
+
+django_model_clean = models.Model.clean
+
+
+def clean(self, *args, **kwargs):
+    """
+    Method to override django clean and trigger to signals
+    """
+    pre_model_clean.send(sender=self._meta.model, instance=self, **kwargs)
+    result = django_model_clean(self)
+    post_model_clean.send(sender=self._meta.model, instance=self, **kwargs)
+    return result
+
+
+models.Model.clean = clean
 
 setattr(QuerySet, "update", update)
 
@@ -61,13 +84,7 @@ class HorillaCompanyManager(models.Manager):
             )
         except Exception as e:
             logger.error(e)
-        try:
-            has_duplicates = queryset.count() != queryset.distinct().count()
-            if has_duplicates:
-                queryset = queryset.distinct()
-        except:
-            pass
-        return queryset
+        return queryset.distinct()
 
     def all(self):
         """
@@ -76,27 +93,32 @@ class HorillaCompanyManager(models.Manager):
         queryset = []
         try:
             queryset = self.get_queryset()
-            if queryset.exists():
-                try:
-                    model_name = queryset.model._meta.model_name
-                    if model_name == "employee":
-                        request = getattr(_thread_locals, "request", None)
-                        if not getattr(request, "is_filtering", None):
-                            queryset = queryset.filter(is_active=True)
-                    else:
-                        for field in queryset.model._meta.fields:
-                            if isinstance(field, models.ForeignKey):
-                                if field.name in self.check_fields:
-                                    related_model_is_active_filter = {
-                                        f"{field.name}__is_active": True
-                                    }
-                                    queryset = queryset.filter(
-                                        **related_model_is_active_filter
-                                    )
-                except:
-                    pass
-        except:
-            pass
+            model_name = queryset.model._meta.model_name
+            if model_name == "employee":
+                request = getattr(_thread_locals, "request", None)
+                if request:
+                    active = (
+                        True
+                        if request.GET.get("is_active", True)
+                        in ["unknown", "True", "true", True]
+                        else False
+                    )
+                    queryset = queryset.filter(is_active=active)
+
+            elif model_name == "offboardingemployee":
+                return queryset
+            else:
+                for field in queryset.model._meta.fields:
+                    if isinstance(field, models.ForeignKey):
+                        if field.name in self.check_fields:
+                            related_model_is_active_filter = {
+                                f"{field.name}__is_active": True
+                            }
+                            queryset = queryset.filter(**related_model_is_active_filter)
+
+        except Exception as e:
+            logger.error(e)
+
         return queryset
 
     def filter(self, *args, **kwargs):

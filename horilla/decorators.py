@@ -3,6 +3,7 @@ import os
 from functools import wraps
 from urllib.parse import urlencode
 
+from django.apps import apps
 from django.contrib import messages
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import redirect, render
@@ -166,6 +167,7 @@ def manager_can_enter(function, perm):
     do not have permission also checks, has reporting manager.
     """
 
+    @wraps(function)
     def _function(request, *args, **kwargs):
         leave_perm = [
             "leave.view_leaverequest",
@@ -232,6 +234,7 @@ def is_recruitment_manager(function, perm):
 
 
 def login_required(view_func):
+    @wraps(view_func)
     def wrapped_view(request, *args, **kwargs):
         path = request.path
         res = path.split("/", 2)[1].capitalize().replace("-", " ").upper()
@@ -284,6 +287,7 @@ def login_required(view_func):
 
 
 def hx_request_required(view_func):
+    @wraps(view_func)
     def wrapped_view(request, *args, **kwargs):
         key = "HTTP_HX_REQUEST"
         if key not in request.META.keys():
@@ -463,3 +467,38 @@ def apply_decorators(decorators):
         return wrapper
 
     return decorator
+
+
+@decorator_with_arguments
+def check_integration_enabled(func, app_name):
+    """
+    Decorator to check if the integration app is installed and enabled.
+    """
+    from base.models import IntegrationApps
+
+    @wraps(func)
+    def wrapper(request=None, *args, **kwargs):
+        if not IntegrationApps.objects.filter(
+            app_label=app_name, is_enabled=True
+        ).exists():
+            if request:
+                try:
+                    app_config = apps.get_app_config(app_name)
+                    app_verbose_name = app_config.verbose_name
+                except LookupError:
+                    app_verbose_name = app_name
+
+                messages.error(request, f"Access to '{app_verbose_name}' is disabled.")
+
+                previous_url = request.META.get("HTTP_REFERER", "/")
+
+                if "HTTP_HX_REQUEST" in request.META:
+                    return render(request, "decorator_404.html")
+
+                script = f'<script>window.location.href = "{previous_url}";</script>'
+                return HttpResponse(script)
+            return None
+
+        return func(request, *args, **kwargs)
+
+    return wrapper

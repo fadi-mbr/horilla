@@ -1,0 +1,184 @@
+{% load static %}
+<div class="fixed inset-y-0 left-0 w-auto bg-white border-r border-r-dark-50 z-50">
+  <div class="p-4">
+    <div class="flex items-center justify-center gap-2 mb-6">
+      <img src="/static/horilla_theme/assets/img/horilla-logo.png" alt="Logo" class="w-10 h-10" />
+    </div>
+
+    <nav class="space-y-2 overflow-hidden overflow-y-auto h-[calc(100vh_-_95px)] sidebar-scroll">
+      {% include "horilla_theme/components/sidebar/top_menu.html" %}
+      {% for menues in sidebar %}
+        <button class="sideboxmain group flex items-center gap-3 p-3 rounded-full transition duration-300"
+          data-menu="{{ menues.menu }}"
+          title="{{ menues.menu }}">
+
+          <img src="{% static menues.img_src %}" alt="" class="w-4.5 h-4.5 transition duration-300 group-hover:filter group-hover:brightness-0 group-hover:invert" />
+          <div class="sidebox absolute shadow-card mb-3 bg-white min-w-64 left-[75px]">
+            <h5 class="border-b border-b-dark-50 py-3 px-3 font-semibold text-left text-[15px]">{{ menues.menu }}</h5>
+            <ul class="p-3">
+              {% for submenu in menues.submenu %}
+                <li>
+                  <a href="{{ submenu.redirect }}">{{ submenu.menu }}</a>
+                </li>
+              {% endfor %}
+            </ul>
+          </div>
+        </button>
+      {% endfor %}
+      {% include "horilla_theme/components/sidebar/bottom_menu.html" %}
+    </nav>
+  </div>
+</div>
+<script>
+    // script to activate the active menu
+  $(".sidebox ul li").hover(function () {
+      // over
+      $(this).addClass("hovered-menu");
+
+
+    }, function () {
+      $(this).removeClass("hovered-menu");
+      // out
+    }
+  );
+
+function highlightRow(checkbox) {
+    checkbox.closest(".oh-sticky-table__tr").removeClass("highlight-selected");
+    checkbox.closest("tr").removeClass("highlight-selected");
+    if (checkbox.is(":checked")) {
+      checkbox.closest(".oh-sticky-table__tr").addClass("highlight-selected");
+      checkbox.closest("tr").addClass("highlight-selected");
+    }
+  }
+
+  function toggleHighlight(ids) {
+    if (!ids.length > 0) return;
+    $.each(ids, function (indexInArray, id) {
+      setTimeout(() => {
+        $(`#${id}`)
+          .closest(".oh-sticky-table__tr")
+          .removeClass("highlight-selected");
+        if ($(`#${id}`).is(":checked")) {
+          $(`#${id}`)
+            .closest(".oh-sticky-table__tr")
+            .addClass("highlight-selected");
+        }
+      }, 1);
+    });
+  }
+
+function reloadSelectedCount(targetElement, storeKey = "selectedInstances") {
+    var count = JSON.parse($(`#${storeKey}`).attr("data-ids") || "[]").length;
+    id = targetElement.attr("id");
+    if (id) {
+        id = id.split("count_")[1];
+    }
+    if (count) {
+        targetElement.html(count);
+        targetElement.parent().removeClass("d-none");
+        $(`#unselect_${id}, #export_${id}, #bulk_udate_${id}`).removeClass(
+            "d-none"
+        );
+    } else {
+        targetElement.parent().addClass("d-none");
+        $(`#unselect_${id}, #export_${id}, #bulk_udate_${id}`).addClass(
+            "d-none"
+        );
+    }
+}
+
+function removeHighlight() {
+    setTimeout(function () {
+        $(".toggle-highlight").removeClass("toggle-highlight");
+    }, 200);
+}
+
+function removeId(element, storeKey = "selectedInstances") {
+    id = element.val();
+    viewId = element.attr("data-view-id");
+    ids = JSON.parse($(`#${storeKey}`).attr("data-ids") || "[]");
+    let elementToRemove = 5;
+    if (ids[ids.length - 1] === id) {
+        ids.pop();
+    }
+    ids = JSON.stringify(ids);
+    $(`#${storeKey}`).attr("data-ids", ids);
+}
+</script>
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    const allMenus = document.querySelectorAll(".sideboxmain");
+
+    // Apply active class from localStorage
+    const activeMenu = localStorage.getItem("activeSidebarMenu");
+    if (activeMenu) {
+      allMenus.forEach(btn => {
+        if (btn.dataset.menu === activeMenu) {
+          btn.classList.add("active");
+        }
+      });
+    }
+
+    // Set new active menu on click
+    allMenus.forEach(btn => {
+      btn.addEventListener("click", function () {
+        localStorage.setItem("activeSidebarMenu", btn.dataset.menu);
+        allMenus.forEach(el => el.classList.remove("active"));
+        btn.classList.add("active");
+      });
+    });
+  });
+
+function isChartEmpty(chart) {
+    return chart.data.datasets.every(dataset => {
+        if (Array.isArray(dataset.data)) {
+            return dataset.data.every(value => !value || value === 0);
+        } else if (typeof dataset.data === 'object') {
+            return Object.values(dataset.data).every(value => !value || value === 0);
+        }
+        return true;
+    });
+}
+
+function showEmptyState(chart, message = "No records available at the moment") {
+    const $canvas = $(chart.canvas);
+    const chartId = $canvas.attr("id");
+
+    // Hide canvas wrapper
+    $canvas.closest(".relative").hide();
+
+    if ($("#no-data-" + chartId).length === 0) {
+        const emptyHTML = `
+      <div id="no-data-${chartId}" class="h-[350px] flex items-center justify-center">
+        <div class="flex flex-col items-center justify-center">
+          <img src="/static/horilla_theme/assets/img/no-records.svg" alt="" width="300" class="mb-4">
+          <p class="text-[#666] mb-5">${message}</p>
+        </div>
+      </div>
+    `;
+        $canvas.closest(".relative").after(emptyHTML);
+    } else {
+        $("#no-data-" + chartId).show();
+    }
+}
+
+function hideEmptyState(chart) {
+    const $canvas = $(chart.canvas);
+    const chartId = $canvas.attr("id");
+
+    // Show canvas wrapper
+    $canvas.closest(".relative").show();
+    $("#no-data-" + chartId).hide();
+}
+
+function emptyChart(chart) {
+    if (!chart) return;
+
+    if (isChartEmpty(chart)) {
+        showEmptyState(chart);
+    } else {
+        hideEmptyState(chart);
+    }
+}
+
+</script>

@@ -1,16 +1,22 @@
 import operator
+import re
+from datetime import date, datetime, timezone
 
 from dateutil.relativedelta import relativedelta
 from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models import Value
+from django.db.models.functions import Concat
+from django.urls import reverse, reverse_lazy
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from base.horilla_company_manager import HorillaCompanyManager
 from base.models import Company, Department, JobPosition
 from employee.models import BonusPoint, Employee
-from horilla import horilla_middlewares
+from horilla.horilla_middlewares import _thread_locals
 from horilla.models import HorillaModel
 from horilla_audit.methods import get_diff
 from horilla_audit.models import HorillaAuditInfo, HorillaAuditLog
@@ -31,6 +37,41 @@ class Period(HorillaModel):
     def __str__(self):
         return self.period_name
 
+    def action_col(self):
+        """
+        For action column
+        """
+
+        return render_template(
+            path="cbv/period/actions.html",
+            context={"instance": self},
+        )
+
+    def detail_view(self):
+        """
+        detail view
+        """
+
+        url = reverse("period-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def detail_view_actions(self):
+        """
+        detail view actions
+        """
+        return render_template(
+            path="cbv/period/detail_view_actions.html",
+            context={"instance": self},
+        )
+
+    def company_id_detail(self):
+        """
+        interviewer in detail view
+        """
+        company_name = self.company_id.all()
+        company_names_string = ", ".join([str(company) for company in company_name])
+        return company_names_string
+
 
 class KeyResult(HorillaModel):
     """model used to create key results"""
@@ -50,7 +91,7 @@ class KeyResult(HorillaModel):
         max_length=60, default="%", choices=PROGRESS_CHOICES
     )
     target_value = models.IntegerField(null=True, blank=True, default=100)
-    duration = models.IntegerField(null=True, blank=True)
+    duration = models.IntegerField(null=True, blank=True, help_text="In Days")
     archive = models.BooleanField(default=False)
     history = HorillaAuditLog(bases=[HorillaAuditInfo])
     company_id = models.ForeignKey(
@@ -73,6 +114,65 @@ class KeyResult(HorillaModel):
 
     def __str__(self):
         return f"{self.title}"
+
+    def get_progress_type(self):
+        currency_dict = dict(self.PROGRESS_CHOICES[2][1])
+        if self.progress_type in currency_dict:
+            return currency_dict[self.progress_type]
+        progress_dict = dict(self.PROGRESS_CHOICES)
+        return progress_dict.get(self.progress_type)
+
+    def action_col(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/key_results/actions.html",
+            context={"instance": self},
+        )
+
+    def detail_action_col(self):
+        """
+        This method for get custome coloumn .
+        """
+
+        return render_template(
+            path="cbv/key_results/detail_view_actions.html",
+            context={"instance": self},
+        )
+
+    def get_avatar(self):
+        """
+        Method will return the API URL for the avatar or the path to the profile image.
+        """
+        sanitized_title = re.sub(r"[^a-zA-Z0-9\s]", "", self.title)
+        sanitized_title = sanitized_title.replace(" ", "+")
+        url = f"https://ui-avatars.com/api/?name={sanitized_title}&background=random"
+        return url
+
+    def get_delete_url(self):
+        """
+        to get the delete url for card action delete
+        """
+
+        url = reverse("delete-key-result", kwargs={"obj_id": self.pk})
+        return url
+
+    def get_detail_url(self):
+        """
+        Detail view url
+        """
+        url = reverse_lazy("key-result-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def get_update_url(self):
+        """
+        to get the update url for card action update
+        """
+
+        url = reverse("update-key-result", kwargs={"pk": self.pk})
+        return url
 
 
 class Objective(HorillaModel):
@@ -138,8 +238,103 @@ class Objective(HorillaModel):
     def __str__(self):
         return f"{self.title}"
 
+    def get_instance_id(self):
+        return self.pk
+
+    def title_col(self):
+        """
+        For title column
+        """
+
+        return render_template(
+            path="cbv/objectives/title.html",
+            context={"instance": self},
+        )
+
+    def manager_col(self):
+        """
+        For manager column
+        """
+
+        return render_template(
+            path="cbv/objectives/manager.html",
+            context={"instance": self},
+        )
+
+    def actions_col(self):
+        """
+        For action column
+        """
+
+        return render_template(
+            path="cbv/objectives/actions.html",
+            context={"instance": self},
+        )
+
+    def self_action_col(self):
+        """
+        For self action column
+        """
+
+        return render_template(
+            path="cbv/objectives/self_objective_action.html",
+            context={"instance": self},
+        )
+
+    def key_res_col(self):
+        """
+        For Key results column
+        """
+
+        return render_template(
+            path="cbv/objectives/key_results.html",
+            context={"instance": self},
+        )
+
+    def self_key_res_col(self):
+        """
+        For Key results column for employee objectives
+        """
+
+        return render_template(
+            path="cbv/objectives/self_key_results.html",
+            context={"instance": self},
+        )
+
+    def assingnees_col(self):
+        """
+        For Key results column
+        """
+
+        return render_template(
+            path="cbv/objectives/assignees.html",
+            context={"instance": self},
+        )
+
+    def duration_col(self):
+        """
+        Duration col
+        """
+        return (
+            str(self.duration) + " " + dict(self.DURATION_UNIT).get(self.duration_unit)
+        )
+
+    def get_employee_objective(self):
+
+        request = getattr(_thread_locals, "request", None)
+        user = request.user.employee_get
+        emp_object = self.employee_objective.get(employee_id=user, objective_id=self.id)
+        return emp_object
+
+    def get_individual_url(self):
+        """
+        Detail view of employee objective
+        """
+        url = reverse_lazy("objective-detailed-view", kwargs={"obj_id": self.pk})
+        return url
+
     def save(self, *args, **kwargs):
-        request = getattr(horilla_middlewares._thread_locals, "request", None)
+        request = getattr(_thread_locals, "request", None)
         selected_company = request.session.get("selected_company")
         if (
             not self.id
@@ -156,11 +351,11 @@ class EmployeeObjective(HorillaModel):
     """this is a EmployObjective model used for creating Employee objectives"""
 
     STATUS_CHOICES = (
+        ("Not Started", _("Not Started")),
         ("On Track", _("On Track")),
         ("Behind", _("Behind")),
-        ("Closed", _("Closed")),
         ("At Risk", _("At Risk")),
-        ("Not Started", _("Not Started")),
+        ("Closed", _("Closed")),
     )
     objective = models.CharField(
         null=True,
@@ -228,7 +423,7 @@ class EmployeeObjective(HorillaModel):
         if len(krs) > 0:
             current = 0
             for kr in krs:
-                current += kr.progress_percentage
+                current += min(kr.progress_percentage, 100)
             self.progress_percentage = int(current / len(krs))
             self.save()
 
@@ -253,11 +448,118 @@ class EmployeeObjective(HorillaModel):
     def tracking(self):
         return get_diff(self)
 
+    def employee_objective_detail_view(self):
+        """
+        for detail view of page
+        """
+        url = reverse("view-employee-objective", kwargs={"pk": self.pk})
+        return url
+
+    def title_col(self):
+        """
+        For title column
+        """
+
+        return render_template(
+            path="cbv/objectives/title.html",
+            context={"instance": self},
+        )
+
+    def emp_obj_action(self):
+        """
+        Action in detail view
+        """
+
+        return render_template(
+            path="cbv/objectives/emp_obj_actions.html",
+            context={"instance": self},
+        )
+
+    def status_col(self):
+        """
+        For status column
+        """
+        objective_key_result_status = self.STATUS_CHOICES
+
+        return render_template(
+            path="cbv/objectives/employee_objective_status.html",
+            context={
+                "instance": self,
+                "objective_key_result_status": objective_key_result_status,
+            },
+        )
+
+    def objective_detail_subtitle(self):
+        """
+        Return subtitle containing both department and job position information.
+        """
+        return f"{self.employee_id.get_department()} / {self.employee_id.get_job_position()}"
+
+    def manager_col(self):
+        """
+        For manager column
+        """
+
+        return render_template(
+            path="cbv/objectives/manager.html",
+            context={"instance": self},
+        )
+
+    def actions_col(self):
+        """
+        For action column
+        """
+
+        return render_template(
+            path="cbv/objectives/actions.html",
+            context={"instance": self},
+        )
+
+    def self_action_col(self):
+        """
+        For self action column
+        """
+
+        return render_template(
+            path="cbv/objectives/self_objective_action.html",
+            context={"instance": self},
+        )
+
+    def key_res_col(self):
+        """
+        For Key results column
+        """
+
+        return render_template(
+            path="cbv/objectives/key_results.html",
+            context={"instance": self},
+        )
+
+    def assingnees_col(self):
+        """
+        For Key results column
+        """
+
+        return render_template(
+            path="cbv/objectives/assignees.html",
+            context={"instance": self},
+        )
+
+    def duration_col(self):
+        """
+        Duration col
+        """
+        return (
+            str(self.objective_id.duration)
+            + " "
+            + dict(self.objective_id.DURATION_UNIT).get(self.objective_id.duration_unit)
+        )
+
 
 class Comment(models.Model):
     """comments for objectives"""
 
-    comment = models.CharField(max_length=150)
+    comment = models.TextField()
     employee_id = models.ForeignKey(
         Employee,
         on_delete=models.DO_NOTHING,
@@ -291,11 +593,11 @@ class EmployeeKeyResult(models.Model):
         ("Currency", (("$", "USD$"), ("₹", "INR"), ("€", "EUR"))),
     )
     STATUS_CHOICES = (
+        ("Not Started", _("Not Started")),
         ("On Track", _("On Track")),
         ("Behind", _("Behind")),
-        ("Closed", _("Closed")),
         ("At Risk", _("At Risk")),
-        ("Not Started", _("Not Started")),
+        ("Closed", _("Closed")),
     )
 
     key_result = models.CharField(max_length=60, null=True, blank=True)
@@ -339,7 +641,156 @@ class EmployeeKeyResult(models.Model):
     progress_percentage = models.IntegerField(default=0)
 
     def __str__(self):
-        return f"{self.key_result_id} | {self.employee_objective_id.employee_id} "
+        return f"{self.key_result_id} | {self.employee_objective_id.employee_id}"
+
+    def get_update_url(self):
+        """
+        to get the update url for card action update
+        """
+
+        url = reverse("employee-key-result-update", kwargs={"pk": self.pk})
+        return url
+
+    def get_delete_url(self):
+        """
+        to get the delete url for card action delete
+        """
+
+        url = reverse("delete-employee-keyresult", kwargs={"kr_id": self.pk})
+        return url
+
+    def key_result_column(self):
+
+        today = datetime.today().date()
+        return render_template(
+            path="cbv/dashboard/keyresult_col.html",
+            context={"instance": self, "today": today},
+        )
+
+    def actions_col(self):
+
+        return render_template(
+            path="cbv/dashboard/actions.html",
+            context={"instance": self},
+        )
+
+    def title_col(self):
+        """
+        For title column
+        """
+        due = None
+        color = "success"
+        if self.end_date:
+            due = (
+                f"due {self.end_date}"
+                if self.end_date == date.today()
+                else f"due in{self.end_date - date.today()}"
+            )
+
+            if self.end_date < date.today():
+                color = "danger"
+            elif self.end_date == date.today():
+                color = "warning"
+
+        col = f"""
+        <span class='d-flex justify-content-between align-items-center'
+        >
+            {self.key_result}
+            <span title = 'due  {due}'>
+                <ion-icon
+                    class="text-{color}"
+                    name="time-sharp"
+                >
+                </ion-icon>
+            </span>
+        </span>
+        """
+
+        return col
+
+    def get_current_value_col(self):
+        """
+        For current value column
+        """
+        # request is required
+        request = _thread_locals.request
+        if (
+            request.user.has_perm("pms.change_objective")
+            or request.user.has_perm("pms.change_employeeobjective")
+            or request.user.has_perm("pms.change_employeekeyresult")
+            or request.user.employee_get
+            in self.employee_objective_id.objective_id.managers.all()
+            or (
+                self.employee_objective_id.objective_id.self_employee_progress_update
+                and (
+                    self.employee_objective_id.employee_id == request.user.employee_get
+                )
+            )
+        ):
+            col = f"""
+                <input
+                    id = "{self.id}"
+                    type="number" class="oh-input p-1"
+                    style="width: 100px;"
+                    min="0"
+                    value="{self.current_value}"
+                    name="current_value"
+                    onchange="delayedProgress(this)"
+                />
+            """
+            return col
+        return self.current_value
+
+    def get_progress_col(self):
+        """
+        For progress column
+        """
+        col = f"""
+        <span class="progressPercentage"> {self.progress_percentage}%</span>
+        """
+        return col
+
+    def status_col(self):
+        """
+        For status column
+        """
+        update_url = reverse(
+            "employee-keyresult-update-status", kwargs={"kr_id": self.pk}
+        )
+        options = "".join(
+            f"<option value='{str(key)}' {'selected' if key == self.status else ''}>{str(value)}</option>"
+            for key, value in self.STATUS_CHOICES
+        )
+
+        col = f"""
+            <select
+                id="keyResultStatus" name="key_result_status"
+                hx-post="{update_url}"
+                hx-trigger="change" class="oh-table__editable-input w-100"
+                hx-on-htmx-after-request = "$('#reloadMessagesButton').click()"
+                hx-swap = "none"
+            >
+                    {options}
+            </select>
+        """
+        return col
+
+    def get_instance_id(self):
+        return self.pk
+
+    def current_value_col(self):
+
+        return render_template(
+            path="cbv/dashboard/current_value.html",
+            context={"instance": self},
+        )
+
+    def progress_col(self):
+
+        return f'<div class="p-percentage">{self.progress_percentage}%</div>'
+
+    def target_value_col(self):
+        return f'<div data-value="{self.target_value}">{self.target_value}</div>'
 
     def update_kr_progress(self):
         if self.target_value != 0:
@@ -400,14 +851,14 @@ class EmployeeKeyResult(models.Model):
             raise ValidationError(
                 "The start value can't be greater than current value or target value."
             )
-        if current_value > target_value:
-            raise ValidationError(
-                {
-                    "current_value": _(
-                        "The current value can't be greater than target value."
-                    )
-                }
-            )
+        # if current_value > target_value:
+        #     raise ValidationError(
+        #         {
+        #             "current_value": _(
+        #                 "The current value can't be greater than target value."
+        #             )
+        #         }
+        #     )
 
     def save(self, *args, **kwargs):
         if self.start_date and not self.end_date:
@@ -445,6 +896,35 @@ class QuestionTemplate(HorillaModel):
 
     def __str__(self):
         return self.question_template
+
+    def question_count(self):
+        return self.question.count()
+
+    def action_col(self):
+        """
+        For action column
+        """
+
+        return render_template(
+            path="cbv/question_template/actions.html",
+            context={"instance": self},
+        )
+
+    def get_avatar(self):
+        """
+        Method will retun the api to the avatar or path to the question template
+        """
+        url = f"https://ui-avatars.com/api/?name={self.question_template}&background=random"
+        return url
+
+    def get_detail_url(self):
+        """
+        Detail view url
+        """
+        url = reverse_lazy(
+            "question-template-detailed-view", kwargs={"template_id": self.pk}
+        )
+        return url
 
 
 class Question(HorillaModel):
@@ -616,6 +1096,89 @@ class Feedback(HorillaModel):
     def __str__(self):
         return f"{self.employee_id.employee_first_name} - {self.review_cycle}"
 
+    def due_days_diff(self):
+        """
+        Returns number of days between current date and end_date.
+        """
+        current_date = timezone.now().date()
+        if not self.end_date:
+            return None
+        return (self.end_date - current_date).days
+
+    def custom_status_style(self):
+        """
+        method for rendering custom status col
+        """
+
+        return render_template(
+            path="cbv/360_feedback/custom_status_col.html",
+            context={"instance": self},
+        )
+
+    def custom_actions_col(self):
+        """
+        method for rendering custom actions col
+        """
+
+        return render_template(
+            path="cbv/360_feedback/custom_actions.html",
+            context={"instance": self},
+        )
+
+    def get_individual_feedback(self):
+        """
+        This method to get individual feedback
+        """
+
+        url = reverse_lazy("feedback-detailed-view", kwargs={"id": self.pk})
+        return url
+
+    def get_feedback_due_date(self):
+        """
+        Due display
+        """
+        if self.status == "Closed":
+            return self.end_date.strftime("%b %d, %Y")
+        current_date = timezone.now().date()
+        date_diff = (self.end_date - current_date).days
+
+        status = (
+            "danger"
+            if self.end_date < current_date
+            else "warning" if self.end_date == current_date else "success"
+        )
+
+        title_text = (
+            "Due today"
+            if self.end_date == current_date
+            else (
+                f"Over due by {abs(date_diff)} days"
+                if self.end_date < current_date
+                else f"Due in {date_diff} days"
+            )
+        )
+
+        html = f"""
+            <span title="{title_text}">
+                <ion-icon
+                    class="text-{status}"
+                    name="time-sharp"
+                >
+                </ion-icon>
+            </span>
+        """
+
+        return f"{self.end_date.strftime('%b %d, %Y')} {html}"
+
+    def custom_due_in_col(self):
+        """
+        This method fro custom due in col
+        """
+        return render_template(
+            path="cbv/360_feedback/due_in_col.html",
+            context={"instance": self, "current_date": datetime.today()},
+        )
+
     def requested_employees(self):
         employees = set(self.subordinate_id.all())
         employees.update(self.colleague_id.all())
@@ -625,6 +1188,28 @@ class Feedback(HorillaModel):
         if self.employee_id:
             employees.add(self.employee_id)
         return list(employees)
+
+    def question_answer(self):
+        """
+        Returns all the values list of question inside the template
+        """
+        # Employee.objects.select_related()
+        return list(
+            self.feedback_answer.annotate(
+                answer_by=Concat(
+                    "employee_id__employee_first_name",
+                    Value(" "),
+                    "employee_id__employee_last_name",
+                    Value(" ("),
+                    "employee_id__badge_id",
+                    Value(")"),
+                ),
+            ).values(
+                "question_id__question",
+                "answer",
+                "answer_by",
+            )
+        )
 
 
 class AnonymousFeedback(models.Model):
@@ -707,6 +1292,40 @@ class AnonymousFeedback(models.Model):
                     )
                 }
             )
+
+    def anonymous_actions_col(self):
+        """
+        method for rendering custom actions col
+        """
+
+        return render_template(
+            path="cbv/360_feedback/anonymous_action.html",
+            context={"instance": self},
+        )
+
+    def get_based_on_value(self):
+        """
+        return based on condition
+        """
+        if self.based_on == "employee":
+            return f"Based On  :  {self.employee_id}"
+        elif self.based_on == "department":
+            return f"Based On  :  {self.department_id}"
+        elif self.based_on == "job_position":
+            return f"Based On  :  {self.job_position_id}"
+        else:
+            return "Based On  :  General"
+
+    def get_individual_anonymous_feedback(self):
+        """
+        This method to get individual feedback
+        """
+
+        url = reverse_lazy("single-anonymous-feedback-view", kwargs={"pk": self.pk})
+        return url
+
+    def detail_view_subtitle(self):
+        return "Anonymous Feedback"
 
 
 class Answer(models.Model):
@@ -798,8 +1417,145 @@ class Meetings(HorillaModel):
     def __str__(self):
         return self.title
 
+    def title_col(self):
+        """
+        For title column
+        """
+
+        return render_template(
+            path="cbv/meetings/title.html",
+            context={"instance": self},
+        )
+
+    def answerable_col(self):
+        """
+        manager in detail view
+        """
+        employees = self.answer_employees.all()
+        if employees:
+            employee_names_string = ", ".join(
+                str(employee.get_full_name()) for employee in employees
+            )
+            return employee_names_string
+        else:
+            return ""
+
+    def detail_action(self):
+        """
+        For answerable employees  column
+        """
+
+        return render_template(
+            path="cbv/meetings/detail_action.html",
+            context={"instance": self},
+        )
+
+    def date_col(self):
+        """
+        For date column
+        """
+
+        return render_template(
+            path="cbv/meetings/date.html",
+            context={"instance": self},
+        )
+
+    def employees_col(self):
+        """
+        For employees column
+        """
+
+        return render_template(
+            path="cbv/meetings/employees.html",
+            context={"instance": self},
+        )
+
+    def managers_col(self):
+        """
+        For manager column
+        """
+
+        return render_template(
+            path="cbv/meetings/managers.html",
+            context={"instance": self},
+        )
+
+    def action_col(self):
+        """
+        For action column
+        """
+
+        return render_template(
+            path="cbv/meetings/actions.html",
+            context={"instance": self},
+        )
+
+    def employ_detail_col(self):
+        """
+        employees in detail view
+        """
+        employees = self.employee_id.all()
+        if employees:
+            employee_names_string = ", ".join(
+                str(employee.get_full_name()) for employee in employees
+            )
+            return employee_names_string
+        else:
+            return ""
+
+    def manager_detail_col(self):
+        """
+        manager in detail view
+        """
+        employees = self.manager.all()
+        if employees:
+            employee_names_string = ", ".join(
+                str(employee.get_full_name()) for employee in employees
+            )
+            return employee_names_string
+        else:
+            return ""
+
+    def mom_detail_col(self):
+        request = getattr(_thread_locals, "request", None)
+        if not self.response:
+            return "-"
+        if (
+            request.user.has_perm("pms.view_meetings")
+            or request.user.employee_get in self.manager.all()
+        ):
+            return self.response
+        return "-" if not self.show_response else self.response
+
+    def mom_col(self):
+        return render_template(
+            path="cbv/meetings/mom_col.html",
+            context={"instance": self},
+        )
+
+    def diff_cell(self):
+        request = getattr(_thread_locals, "request", None)
+        if not getattr(self, "request", None):
+            self.request = request
+        if request.user.employee_get in self.manager.all():
+            return f'style="background-color: rgba(255, 166, 0, 0.158);" '
+
+    def meeting_detail_view(self):
+        """
+        detail view
+        """
+        url = reverse("meetings-detail-view", kwargs={"pk": self.pk})
+        return url
+
+    def get_avatar(self):
+        """
+        Method will retun the api to the avatar or path to the profile image
+        """
+        url = f"https://ui-avatars.com/api/?name={self.title}&background=random"
+        return url
+
     def save(self, *args, **kwargs):
-        request = getattr(horilla_middlewares._thread_locals, "request", None)
+        request = getattr(_thread_locals, "request", None)
         selected_company = request.session.get("selected_company")
         if (
             not self.id
@@ -1051,4 +1807,4 @@ def manipulate_existing_data():
         return
 
 
-manipulate_existing_data()
+# manipulate_existing_data()

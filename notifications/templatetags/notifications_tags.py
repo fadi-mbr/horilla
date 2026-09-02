@@ -1,25 +1,15 @@
 """ Django notifications template tags file """
 
-# -*- coding: utf-8 -*-
-from distutils.version import (  # pylint: disable=no-name-in-module,import-error
-    StrictVersion,
-)
-
 from django import get_version
 from django.template import Library
+from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-
-try:
-    from django.urls import reverse
-except ImportError:
-    from django.core.urlresolvers import (  # pylint: disable=no-name-in-module,import-error
-        reverse,
-    )
 
 register = Library()
 
 
+@register.simple_tag(takes_context=True)
 def notifications_unread(context):
     user = user_context(context)
     if not user:
@@ -27,14 +17,7 @@ def notifications_unread(context):
     return user.notifications.unread().count()
 
 
-if StrictVersion(get_version()) >= StrictVersion("2.0"):
-    notifications_unread = register.simple_tag(takes_context=True)(
-        notifications_unread
-    )  # pylint: disable=invalid-name
-else:
-    notifications_unread = register.assignment_tag(takes_context=True)(
-        notifications_unread
-    )  # noqa
+notifications_unread = register.simple_tag(takes_context=True)(notifications_unread)
 
 
 @register.filter

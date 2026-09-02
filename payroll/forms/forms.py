@@ -47,6 +47,20 @@ class ContractForm(ModelForm):
         self.fields["employee_id"].widget.attrs.update(
             {"onchange": "contractInitial(this)"}
         )
+        self.fields["contract_start_date"].widget = widgets.DateInput(
+            attrs={
+                "type": "date",
+                "class": "oh-input w-100",
+                "placeholder": "Select a date",
+            }
+        )
+        self.fields["contract_end_date"].widget = widgets.DateInput(
+            attrs={
+                "type": "date",
+                "class": "oh-input w-100",
+                "placeholder": "Select a date",
+            }
+        )
         self.fields["contract_status"].widget.attrs.update(
             {
                 "class": "oh-select",
@@ -180,3 +194,11 @@ class DashboardExport(Form):
         ],
         widget=forms.SelectMultiple,
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["employees"].widget.attrs.update({"class": "oh-select oh-select-2"})
+        self.fields["status"].widget.attrs.update({"class": "oh-select oh-select-2"})
+        self.fields["contributions"].widget.attrs.update(
+            {"class": "oh-select oh-select-2"}
+        )

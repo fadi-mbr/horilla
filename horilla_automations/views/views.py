@@ -66,6 +66,7 @@ def refresh_automations(request):
     Method to  refresh automation signals
     """
     refreshed = False
+
     if REFRESH_METHODS.get("clear_connection"):
         REFRESH_METHODS["clear_connection"]()
         refreshed = True

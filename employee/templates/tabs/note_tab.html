@@ -135,7 +135,8 @@
     </ol>
 {% else %}
     <div class="mt-4">
-        <form hx-target="#note_target" hx-post="{% url 'add-employee-note' employee.id %}" id="commentForm">
+        <form hx-target="#note_target" hx-post="{% url 'add-employee-note' employee.id %}"
+            id="commentForm">
             {% csrf_token %}
             <div>
                 <div class="mt-4">

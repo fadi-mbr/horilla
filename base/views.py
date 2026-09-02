@@ -21,11 +21,13 @@ from django.apps import apps
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.models import Group, Permission, User
+from django.contrib.auth.models import Group, Permission
 from django.contrib.auth.views import PasswordResetConfirmView, PasswordResetView
+from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.mail import EmailMessage, EmailMultiAlternatives
 from django.core.management import call_command
+from django.core.validators import validate_ipv46_address
 from django.db.models import ProtectedError, Q
 from django.http import (
     FileResponse,
@@ -38,11 +40,16 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse, reverse_lazy
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from django.utils.html import strip_tags
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.translation import gettext as _
+from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.tokens import UntypedToken
 
 from accessibility.accessibility import ACCESSBILITY_FEATURE
 from accessibility.models import DefaultAccessibility
@@ -112,6 +119,7 @@ from base.forms import (
     WorkTypeRequestForm,
 )
 from base.methods import (
+    check_chart_permission,
     choosesubordinates,
     closest_numbers,
     export_data,
@@ -142,10 +150,12 @@ from base.models import (
     EmployeeType,
     Holidays,
     HorillaMailTemplate,
+    IntegrationApps,
     JobPosition,
     JobRole,
     MultipleApprovalCondition,
     MultipleApprovalManagers,
+    PenaltyAccounts,
     RotatingShift,
     RotatingWorkType,
     RotatingWorkTypeAssign,
@@ -166,7 +176,6 @@ from employee.models import (
     EmployeeWorkInformation,
     ProfileEditFeature,
 )
-from horilla import horilla_apps
 from horilla.decorators import (
     delete_permission,
     duplicate_permission,
@@ -176,18 +185,38 @@ from horilla.decorators import (
     permission_required,
 )
 from horilla.group_by import group_by_queryset
-from horilla.horilla_settings import (
-    APPS,
-    DB_INIT_PASSWORD,
-    DYNAMIC_URL_PATTERNS,
-    FILE_STORAGE,
-    NO_PERMISSION_MODALS,
-)
 from horilla.methods import get_horilla_model_class, remove_dynamic_url
 from horilla_audit.forms import HistoryTrackingFieldsForm
 from horilla_audit.models import AccountBlockUnblock, AuditTag, HistoryTrackingFields
+from horilla_auth.models import HorillaUser
 from notifications.models import Notification
 from notifications.signals import notify
+
+CHARTS = [
+    ("employee_work_info", _("Employee Work Info")),
+    ("offline_employees", _("Offline Employees")),
+    ("online_employees", _("Online Employees")),
+    ("overall_leave_chart", _("Overall Leave Chart")),
+    ("hired_candidates", _("Hired Candidates")),
+    ("onboarding_candidates", _("Onboarding Candidates")),
+    ("recruitment_analytics", _("Recruitment Analytics")),
+    ("attendance_analytic", _("Attendance analytics")),
+    ("hours_chart", _("Hours Chart")),
+    ("employees_chart", _("Employees Chart")),
+    ("department_chart", _("Department Chart")),
+    ("gender_chart", _("Gender Chart")),
+    ("shift_request_approve", _("Shift Request to Approve")),
+    ("work_type_request_approve", _("Work Type Request to Approve")),
+    ("overtime_approve", _("Overtime to Approve")),
+    ("attendance_validate", _("Attendance to Validate")),
+    ("leave_request_approve", _("Leave Request to Approve")),
+    ("leave_allocation_approve", _("Leave Allocation to Approve")),
+    ("feedback_answer", _("Feedbacks to Answer")),
+    ("asset_request_approve", _("Asset Request to Approve")),
+    ("objective_status", _("Objective Status")),
+    ("key_result_status", _("Key Result Status")),
+    ("feedback_status", _("Feedback Status")),
+]
 
 
 def custom404(request):
@@ -224,10 +253,10 @@ def initialize_database_condition():
     Returns:
         bool: True if the database needs to be initialized, False otherwise.
     """
-    init_database = not User.objects.exists()
+    init_database = not HorillaUser.objects.exists()
     if not init_database:
         init_database = True
-        superusers = User.objects.filter(is_superuser=True)
+        superusers = HorillaUser.objects.filter(is_superuser=True)
         for user in superusers:
             if hasattr(user, "employee_get"):
                 init_database = False
@@ -238,7 +267,7 @@ def initialize_database_condition():
 def load_demo_database(request):
     if initialize_database_condition():
         if request.method == "POST":
-            if request.POST.get("load_data_password") == DB_INIT_PASSWORD:
+            if request.POST.get("load_data_password") == settings.DB_INIT_PASSWORD:
                 data_files = [
                     "user_data.json",
                     "employee_info_data.json",
@@ -291,7 +320,7 @@ def initialize_database(request):
     if initialize_database_condition():
         if request.method == "POST":
             password = request._post.get("password")
-            if DB_INIT_PASSWORD == password:
+            if settings.DB_INIT_PASSWORD == password:
                 return redirect(initialize_database_user)
             else:
                 messages.warning(
@@ -327,10 +356,10 @@ def initialize_database_user(request):
         badge_id = form_data.get("badge_id")
         email = form_data.get("email")
         phone = form_data.get("phone")
-        user = User.objects.filter(username=username).first()
+        user = HorillaUser.objects.filter(username=username).first()
         if user and not hasattr(user, "employee_get"):
             user.delete()
-        user = User.objects.create_superuser(
+        user = HorillaUser.objects.create_superuser(
             username=username, email=email, password=password
         )
         employee = Employee()
@@ -579,7 +608,7 @@ def login_user(request):
         user = authenticate(request, username=username, password=password)
 
         if not user:
-            user_object = User.objects.filter(username=username).first()
+            user_object = HorillaUser.objects.filter(username=username).first()
             if user_object and not user_object.is_active:
                 messages.warning(request, _("Access Denied: Your account is blocked."))
             else:
@@ -641,154 +670,6 @@ def reset_send_success(request):
     return render(request, "reset_send.html")
 
 
-# ---------------------------------------------------------------------------
-# Google OAuth — native Horilla sign-in
-# Uses google-auth-oauthlib (already in requirements.txt).
-# Flow: /login/google/ → Google consent → /login/google/callback/
-# CF Access (@mbrme.com gate) is the outer perimeter; this is the inner SSO.
-# ---------------------------------------------------------------------------
-
-def _build_google_flow(request):
-    """Return a configured Flow with the callback URI bound to this request."""
-    import secrets as _secrets
-
-    from google_auth_oauthlib.flow import Flow
-
-    client_config = {
-        "web": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [
-                request.build_absolute_uri(reverse("google-oauth-callback"))
-            ],
-        }
-    }
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=["openid", "email", "profile"],
-    )
-    flow.redirect_uri = request.build_absolute_uri(reverse("google-oauth-callback"))
-    return flow
-
-
-def google_oauth_init(request):
-    """Redirect the browser to Google's OAuth consent screen."""
-    import logging
-    import secrets as _secrets
-
-    if not settings.GOOGLE_CLIENT_ID:
-        messages.error(request, "Google sign-in is not configured.")
-        return redirect("login")
-
-    flow = _build_google_flow(request)
-
-    state = _secrets.token_urlsafe(32)
-    request.session["google_oauth_state"] = state
-    request.session["google_oauth_next"] = request.GET.get("next", "/")
-
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        state=state,
-        hd=settings.GOOGLE_OAUTH_ALLOWED_DOMAIN,
-        prompt="select_account",
-        include_granted_scopes="true",
-    )
-
-    # Persist PKCE code verifier so the callback can prove ownership to Google
-    if getattr(flow, "code_verifier", None):
-        request.session["google_oauth_code_verifier"] = flow.code_verifier
-
-    return redirect(auth_url)
-
-
-def google_oauth_callback(request):
-    """Handle the redirect back from Google, authenticate, and log the user in."""
-    import logging
-    import os
-
-    import google.auth.transport.requests
-    from google.oauth2 import id_token as google_id_token
-
-    logger = logging.getLogger(__name__)
-
-    error = request.GET.get("error")
-    if error:
-        messages.error(request, "Google sign-in was cancelled or denied.")
-        return redirect("login")
-
-    # CSRF — validate state
-    expected_state = request.session.pop("google_oauth_state", None)
-    returned_state = request.GET.get("state")
-    if not expected_state or expected_state != returned_state:
-        messages.error(request, "Authentication failed: invalid state parameter.")
-        return redirect("login")
-
-    next_url = request.session.pop("google_oauth_next", "/")
-    code_verifier = request.session.pop("google_oauth_code_verifier", None)
-
-    try:
-        # Relax scope checking — Google may return scopes in a different order
-        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-        flow = _build_google_flow(request)
-        # Restore PKCE verifier so Google can validate the code challenge
-        if code_verifier:
-            flow.code_verifier = code_verifier
-        flow.fetch_token(code=request.GET.get("code"))
-        credentials = flow.credentials
-
-        # Verify the ID token with Google's public keys
-        google_request = google.auth.transport.requests.Request()
-        id_info = google_id_token.verify_oauth2_token(
-            credentials.id_token,
-            google_request,
-            settings.GOOGLE_CLIENT_ID,
-            clock_skew_in_seconds=10,
-        )
-    except Exception as exc:
-        import sys
-        import traceback
-        print(f"[google-oauth] callback error: {exc}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        logger.error("Google OAuth callback failed: %s", exc, exc_info=True)
-        messages.error(request, f"Google sign-in failed: {type(exc).__name__}: {exc}")
-        return redirect("login")
-
-    email = id_info.get("email", "").lower()
-    if not email.endswith(f"@{settings.GOOGLE_OAUTH_ALLOWED_DOMAIN}"):
-        messages.error(
-            request,
-            f"Sign-in is restricted to @{settings.GOOGLE_OAUTH_ALLOWED_DOMAIN} accounts.",
-        )
-        return redirect("login")
-
-    user = User.objects.filter(email__iexact=email, is_active=True).first()
-    if not user:
-        messages.error(
-            request,
-            "No Horilla account found for this Google identity. Contact your administrator.",
-        )
-        return redirect("login")
-
-    employee = getattr(user, "employee_get", None)
-    if employee is None or not employee.is_active:
-        messages.error(
-            request,
-            "Your employee account is not active. Contact your administrator.",
-        )
-        return redirect("login")
-
-    # Specify backend explicitly (required when not going through authenticate())
-    user.backend = "django.contrib.auth.backends.ModelBackend"
-    login(request, user)
-    messages.success(request, f"Welcome, {user.get_full_name() or email}!")
-
-    if not url_has_allowed_host_and_scheme(next_url, allowed_hosts={request.get_host()}):
-        next_url = "/"
-    return redirect(next_url)
-
-
 class HorillaPasswordResetView(PasswordResetView):
     """
     Horilla View for Reset Password
@@ -810,7 +691,7 @@ class HorillaPasswordResetView(PasswordResetView):
             return redirect("forgot-password")
 
         username = form.cleaned_data["email"]
-        user = User.objects.filter(username=username).first()
+        user = HorillaUser.objects.filter(username=username).first()
         if user:
             opts = {
                 "use_https": self.request.is_secure(),
@@ -856,7 +737,7 @@ class EmployeePasswordResetView(PasswordResetView):
                 return HttpResponseRedirect(self.request.META.get("HTTP_REFERER", "/"))
 
             username = form.cleaned_data["email"]
-            user = User.objects.filter(username=username).first()
+            user = HorillaUser.objects.filter(username=username).first()
             if user:
                 opts = {
                     "use_https": self.request.is_secure(),
@@ -978,7 +859,7 @@ def two_factor_auth(request):
             messages.error(request, "Invalid OTP.")
             return render(request, "base/auth/two_factor_auth.html")
 
-    if not horilla_apps.TWO_FACTORS_AUTHENTICATION:
+    if not settings.TWO_FACTORS_AUTHENTICATION:
         return redirect("/")
 
     if otp is None:
@@ -1091,11 +972,32 @@ def home(request):
             and user.employee_get.dob.day == today.day
         )
 
+    show_section = any(
+        [
+            request.user.has_perm("attendance.view_attendancevalidationcondition"),
+            request.user.has_perm("helpdesk.view_departmentmanager"),
+            request.user.has_perm("helpdesk.view_tickettype"),
+            request.user.has_perm("employee.view_employeetag"),
+            request.user.has_perm("pms.add_bonuspointsetting"),
+            request.user.has_perm("payroll.view_payslipautogenerate"),
+            request.user.has_perm("leave.add_restrictleave"),
+            request.user.has_perm("base.view_biometricattendance"),
+            request.user.has_perm("attendance.add_attendance"),
+            request.user.has_perm("geofencing.add_geofencing"),
+            request.user.has_perm("facedetection.add_facedetection"),
+            request.user.has_perm("recruitment.view_recruitment"),
+            request.user.has_perm("recruitment.view_rejectreason"),
+            request.user.has_perm("recruitment.add_recruitment"),
+            request.user.has_perm("recruitment.add_linkedinaccount"),
+        ]
+    )
+
     context = {
         "first_day_of_week": first_day_of_week.strftime("%Y-%m-%d"),
         "last_day_of_week": last_day_of_week.strftime("%Y-%m-%d"),
         "charts": employee_charts.charts,
         "is_birthday": is_birthday,
+        "show_section": show_section,
     }
 
     return render(request, "index.html", context)
@@ -1194,8 +1096,8 @@ def user_group_table(request):
     Group assign htmx view
     """
     permissions = []
-    apps = APPS
-    no_permission_models = NO_PERMISSION_MODALS
+    apps = settings.APPS
+    no_permission_models = settings.NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -1263,8 +1165,8 @@ def user_group(request):
     """
     permissions = []
 
-    apps = APPS
-    no_permission_models = NO_PERMISSION_MODALS
+    apps = settings.APPS
+    no_permission_models = settings.NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -1299,8 +1201,8 @@ def user_group_search(request):
     """
     permissions = []
 
-    apps = APPS
-    no_permission_models = NO_PERMISSION_MODALS
+    apps = settings.APPS
+    no_permission_models = settings.NO_PERMISSION_MODALS
     form = UserGroupForm()
     for app_name in apps:
         app_models = []
@@ -1418,7 +1320,7 @@ def group_remove_user(request, uid, gid):
         gid: group instance id
     """
     group = Group.objects.get(id=gid)
-    user = User.objects.get(id=uid)
+    user = HorillaUser.objects.get(id=uid)
     group.user_set.remove(user)
     return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
@@ -1438,7 +1340,7 @@ def object_delete(request, obj_id, **kwargs):
             - model (Model): The Django model class to which the object belongs.
             - redirect_path (str): The URL path to redirect to after deletion.
     Returns:
-        HttpResponse: Redirects to the specified `redirect_path` or reloads the
+        HttpResponse: Redirects to the specified redirect_path or reloads the
                       previous page. In case of a ProtectedError, it shows an error
                       message indicating that the object is in use.
     """
@@ -1560,7 +1462,6 @@ def object_duplicate(request, obj_id, **kwargs):
 
 @login_required
 @hx_request_required
-@duplicate_permission()
 def add_remove_dynamic_fields(request, **kwargs):
     """
     Handles the dynamic addition and removal of form fields in a Django form.
@@ -1591,6 +1492,7 @@ def add_remove_dynamic_fields(request, **kwargs):
         field_name_pre = kwargs["field_name_pre"]
         field_type = kwargs.get("field_type")
         hx_target = request.META.get("HTTP_HX_TARGET")
+
         if hx_target:
             field_counts = int(hx_target.split("_")[-1]) + 1
             next_hx_target = f"{hx_target.rsplit('_', 1)[0]}_{field_counts}"
@@ -1612,7 +1514,7 @@ def add_remove_dynamic_fields(request, **kwargs):
                     queryset=model.objects.all(),
                     widget=forms.Select(
                         attrs={
-                            "class": "oh-select oh-select-2 mb-3",
+                            "class": "oh-select oh-select-2 mb-3 w-100",
                             "name": field_name,
                             "id": f"id_{field_name}",
                         }
@@ -1620,12 +1522,14 @@ def add_remove_dynamic_fields(request, **kwargs):
                     required=False,
                     empty_label=empty_label,
                 )
+
             context = {
                 "field_counts": field_counts,
                 "field_html": form[field_name].as_widget(),
                 "current_hx_target": hx_target,
                 "next_hx_target": next_hx_target,
             }
+
             field_html = render_to_string(template, context)
             return HttpResponse(field_html)
     return HttpResponse()
@@ -1652,7 +1556,7 @@ def mail_server_conf(request):
 @permission_required("base.view_dynamicemailconfiguration")
 def mail_server_test_email(request):
     instance_id = request.GET.get("instance_id")
-    white_labelling = getattr(horilla_apps, "WHITE_LABELLING", False)
+    white_labelling = getattr(settings, "WHITE_LABELLING", False)
     image_path = path.join(settings.STATIC_ROOT, "images/ui/horilla-logo.png")
     company_name = "Horilla"
 
@@ -1731,7 +1635,6 @@ def mail_server_test_email(request):
                     msg.attach(msg_img)
 
                 msg.send()
-
             except Exception as e:
                 messages.error(request, " ".join([_("Something went wrong :"), str(e)]))
                 return HttpResponse("<script>window.location.reload()</script>")
@@ -2552,6 +2455,9 @@ def rotating_work_type_assign_redirect(request, obj_id=None, employee_id=None):
     request_copy.pop("instances_ids", None)
     previous_data = request_copy.urlencode()
     hx_target = request.META.get("HTTP_HX_TARGET", None)
+    hx_current_url = request.META.get("HTTP_HX_CURRENT_URL", None)
+    parsed_url = urlparse(hx_current_url)
+    hx_current_path = parsed_url.path.lstrip("/")
     if hx_target and hx_target == "view-container":
         return redirect(f"/rotating-work-type-assign-view?{previous_data}")
     elif hx_target and hx_target == "objectDetailsModalTarget":
@@ -2568,6 +2474,33 @@ def rotating_work_type_assign_redirect(request, obj_id=None, employee_id=None):
         return redirect(url + params)
     elif hx_target and hx_target == "shift_target" and employee_id:
         return redirect(f"/employee/shift-tab/{employee_id}")
+
+    elif hx_target and hx_target == "genericModalBody":
+        instances_ids = request.GET.get("instances_ids")
+        instances_list = json.loads(instances_ids)
+        if obj_id in instances_list:
+            instances_list.remove(obj_id)
+        previous_instance, next_instance = closest_numbers(
+            json.loads(instances_ids), obj_id
+        )
+
+        return redirect(
+            f"/work-rotating-detail-view/{next_instance}/?{previous_data}&instances_ids={instances_list}&deleted=True"
+        )
+
+    elif hx_target and hx_target == "rotating-work-container":
+        if hx_current_path == "employee/rotating-work-type-assign/":
+            rwork_type_requests = RotatingWorkTypeAssign.objects.all()
+            previous_data = request.GET.urlencode()
+            if rwork_type_requests.exists():
+                return redirect(f"/rotating-list-view?is_active=True&{previous_data}")
+            else:
+                return HttpResponse("<script>window.location.reload()</script>")
+        else:
+            return redirect(
+                f"/employee-rotating-work-tab-list/{employee_id}?deleted=True"
+            )
+
     elif hx_target:
         return HttpResponse("<script>window.location.reload()</script>")
     else:
@@ -2608,9 +2541,13 @@ def rotating_work_type_assign_bulk_archive(request):
     """
     This method is used to archive/un-archive bulk rotating work type assigns.
     """
-    ids = json.loads(request.POST["ids"])
-    is_active = request.POST.get("is_active") != "false"
-    message = _("un-archived") if is_active else _("archived")
+    ids = request.POST["ids"]
+    ids = json.loads(ids)
+    is_active = True
+    message = _("un-archived")
+    if request.GET.get("is_active") == "False":
+        is_active = False
+        message = _("archived")
     count = 0
 
     for id in ids:
@@ -2638,6 +2575,8 @@ def rotating_work_type_assign_bulk_archive(request):
                 count=count, message=message
             ),
         )
+
+        return JsonResponse({"message": "Success"})
 
     return rotating_work_type_assign_redirect(request)
 
@@ -3411,11 +3350,32 @@ def rotating_shift_assign_redirect(request, obj_id, employee_id):
         previous_instance, next_instance = closest_numbers(
             json.loads(instances_ids), obj_id
         )
-        url = f"/rshit-individual-view/{next_instance}/"
-        params = f"?{previous_data}&instances_ids={instances_list}"
-        return redirect(url + params)
+        return redirect(
+            f"/rshit-individual-view/{next_instance}/?{previous_data}\
+            &instances_ids={instances_list}"
+        )
+    elif hx_target and hx_target == "genericModalBody":
+        instances_ids = request.GET.get("instances_ids")
+        instances_list = json.loads(instances_ids)
+        if obj_id in instances_list:
+            instances_list.remove(obj_id)
+        previous_instance, next_instance = closest_numbers(
+            json.loads(instances_ids), obj_id
+        )
+        return redirect(
+            f"/rotating-shift-individual-detail-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&detail=true"
+        )
     elif hx_target and hx_target == "shift_target" and employee_id:
         return redirect(f"/employee/shift-tab/{employee_id}")
+    elif hx_target and hx_target == "rotating-shift-container":
+        path = request.META.get("HTTP_HX_CURRENT_URL", None)
+        parsed_url = urlparse(path)
+        parsed_path = parsed_url.path.lstrip("/")
+        if parsed_path == "employee/rotating-shift-assign/":
+            return redirect(f"/rotating-shift-request-list/?is_active=true")
+        return redirect(
+            f"/rotating-shift-individual-tab-view/{employee_id}?deleted=true"
+        )
     elif hx_target:
         return HttpResponse("<script>window.location.reload()</script>")
     else:
@@ -3560,16 +3520,24 @@ def get_models_in_app(app_name):
 
 @login_required
 @manager_can_enter("auth.view_permission")
-def employee_permission_assign(request):
+def employee_permission_assign(request, pk=None):
     """
     This method is used to assign permissions to employee user
     """
 
     context = {}
     template = "base/auth/permission.html"
-    if request.GET.get("profile_tab") and request.GET.get("employee_id"):
+    path = request.path
+    parts = path.strip("/").split("/")
+    id_part = parts[-1]
+    emp_id = None
+    if id_part != "employee-permission-assign":
+        emp_id = id_part
+    else:
+        id_part = None
+    if emp_id:
         template = "tabs/group_permissions.html"
-        employees = Employee.objects.filter(id=request.GET["employee_id"])
+        employees = Employee.objects.filter(id=emp_id)
         context["employee"] = employees.first()
     else:
         employees = Employee.objects.filter(
@@ -3585,13 +3553,13 @@ def employee_permission_assign(request):
                     "model_name": model._meta.model_name,
                 }
                 for model in get_models_in_app(app_name)
-                if model._meta.model_name not in NO_PERMISSION_MODALS
+                if model._meta.model_name not in settings.NO_PERMISSION_MODALS
             ],
         }
-        for app_name in APPS
+        for app_name in settings.APPS
     ]
     context["permissions"] = permissions
-    context["no_permission_models"] = NO_PERMISSION_MODALS
+    context["no_permission_models"] = settings.NO_PERMISSION_MODALS
     context["employees"] = paginator_qry(employees, request.GET.get("page"))
     return render(
         request,
@@ -3626,13 +3594,13 @@ def employee_permission_search(request, codename=None, uid=None):
                     "model_name": model._meta.model_name,
                 }
                 for model in get_models_in_app(app_name)
-                if model._meta.model_name not in NO_PERMISSION_MODALS
+                if model._meta.model_name not in settings.NO_PERMISSION_MODALS
             ],
         }
-        for app_name in APPS
+        for app_name in settings.APPS
     ]
     context["permissions"] = permissions
-    context["no_permission_models"] = NO_PERMISSION_MODALS
+    context["no_permission_models"] = settings.NO_PERMISSION_MODALS
     context["employees"] = paginator_qry(employees, request.GET.get("page"))
     return render(
         request,
@@ -3673,10 +3641,10 @@ def permission_table(request):
     This method is used to render the permission table
     """
     permissions = []
-    apps = APPS
+    apps = settings.APPS
     form = AssignPermission()
 
-    no_permission_models = NO_PERMISSION_MODALS
+    no_permission_models = settings.NO_PERMISSION_MODALS
 
     for app_name in apps:
         app_models = []
@@ -4183,6 +4151,7 @@ def work_type_request_delete(request, obj_id):
         id : work type request instance id
 
     """
+
     try:
         work_type_request = WorkTypeRequest.objects.get(id=obj_id)
         employee = work_type_request.employee_id
@@ -4204,8 +4173,12 @@ def work_type_request_delete(request, obj_id):
         messages.error(request, _("Work type request not found."))
     except ProtectedError:
         messages.error(request, _("You cannot delete this work type request."))
+
     hx_target = request.META.get("HTTP_HX_TARGET", None)
-    if hx_target and hx_target == "objectDetailsModalTarget":
+    hx_current_url = request.META.get("HTTP_HX_CURRENT_URL", None)
+    parsed_url = urlparse(hx_current_url)
+    hx_current_path = parsed_url.path.lstrip("/")
+    if hx_target and hx_target == "genericModalBody":
         instances_ids = request.GET.get("instances_ids")
         instances_list = json.loads(instances_ids)
         if obj_id in instances_list:
@@ -4213,19 +4186,32 @@ def work_type_request_delete(request, obj_id):
         previous_instance, next_instance = closest_numbers(
             json.loads(instances_ids), obj_id
         )
-        return redirect(
-            f"/work-type-request-single-view/{next_instance}/?instances_ids={instances_list}"
-        )
-    elif hx_target and hx_target == "view-container":
         previous_data = request.GET.urlencode()
-        work_type_requests = WorkTypeRequest.objects.all()
-        if work_type_requests.exists():
-            return redirect(f"/work-type-request-search?{previous_data}")
+        return redirect(
+            f"/work-detail-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
+        )
+    # elif hx_target and hx_target == "listContainer":
+    #     previous_data = request.GET.urlencode()
+    #     work_type_requests = WorkTypeRequest.objects.all()
+    #     if work_type_requests.exists():
+    #         return redirect(f"/work-list-view?{previous_data}")
+    #     else:
+    #         return HttpResponse("<script>window.location.reload()</script>")
+
+    elif hx_target and hx_target == "work-shift":
+        if hx_current_path == "employee/work-type-request-view/":
+            work_type_requests = WorkTypeRequest.objects.all()
+            previous_data = request.GET.urlencode()
+            if work_type_requests.exists():
+                return redirect(f"/work-list-view?{previous_data}")
+            else:
+                return HttpResponse("<script>window.location.reload()</script>")
         else:
-            return HttpResponse("<script>window.location.reload()</script>")
+            return redirect(f"/employeeprofileview-Work Type & Shift/{employee.id}")
 
     elif hx_target and hx_target == "shift_target" and employee:
         return redirect(f"/employee/shift-tab/{employee.id}")
+
     else:
         return HttpResponse("<script>window.location.reload()</script>")
 
@@ -4269,12 +4255,13 @@ def work_type_request_bulk_delete(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    del_ids = []
     for id in ids:
         try:
             work_type_request = WorkTypeRequest.objects.get(id=id)
             user = work_type_request.employee_id.employee_user_id
             work_type_request.delete()
-            messages.success(request, _("Work type request deleted."))
+            del_ids.append(work_type_request)
             notify.send(
                 request.user.employee_get,
                 recipient=user,
@@ -4299,6 +4286,7 @@ def work_type_request_bulk_delete(request):
                 ),
             )
         result = True
+    messages.success(request, _("{} work type requests deleted.".format(len(del_ids))))
     return JsonResponse({"result": result})
 
 
@@ -5152,6 +5140,7 @@ def shift_request_delete(request, id):
         id : shift request instance id
 
     """
+
     try:
         shift_request = ShiftRequest.find(id)
         user = shift_request.employee_id.employee_user_id
@@ -5175,8 +5164,32 @@ def shift_request_delete(request, id):
         messages.error(request, _("You cannot delete this shift request."))
 
     hx_target = request.META.get("HTTP_HX_TARGET", None)
-    if hx_target and hx_target == "shift_target" and shift_request.employee_id:
-        return redirect(f"/employee/shift-tab/{shift_request.employee_id.id}")
+    path = request.META.get("HTTP_HX_CURRENT_URL", None)
+    parsed_url = urlparse(path)
+    parsed_path = parsed_url.path.lstrip("/")
+    if hx_target and hx_target == "shift-container":
+        previous_data = request.GET.urlencode()
+        if parsed_path == "employee/shift-request-view/":
+            return redirect(f"/list-shift-request/?deleted=true")
+        else:
+            return redirect(
+                f"/shift-request-individual-tab-view/{shift_request.employee_id.id}?deleted=true"
+            )
+    if hx_target and hx_target == "genericModalBody":
+        previous_data = request.GET.urlencode()
+        instances_ids = request.GET.get("instances_ids", None)
+        instances_list = json.loads(instances_ids) if instances_ids else []
+        if id in instances_list:
+            instances_list.remove(id)
+            previous_instance, next_instance = closest_numbers(
+                json.loads(instances_ids), id
+            )
+            return redirect(
+                f"/shift-detail-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
+            )
+        else:
+            return HttpResponse(status=204, headers={"HX-Refresh": "true"})
+
     return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
 
@@ -5192,13 +5205,14 @@ def shift_request_bulk_delete(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    del_ids = []
     result = False
     for id in ids:
         try:
             shift_request = ShiftRequest.objects.get(id=id)
             user = shift_request.employee_id.employee_user_id
             shift_request.delete()
-            messages.success(request, _("Shift request deleted."))
+            del_ids.append(shift_request)
             notify.send(
                 request.user.employee_get,
                 recipient=user,
@@ -5223,6 +5237,8 @@ def shift_request_bulk_delete(request):
                 ),
             )
         result = True
+
+    messages.success(request, _("{} shift requests deleted.".format(len(del_ids))))
     return JsonResponse({"result": result})
 
 
@@ -5404,6 +5420,34 @@ def general_settings(request):
             form.save()
             messages.success(request, _("Settings updated."))
             return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+
+    general_section = any(
+        [
+            request.user.has_perm("base.change_announcementexpire"),
+            request.user.has_perm("base.view_dynamicpagination"),
+            request.user.has_perm("horilla_audit.view_accountblockunblock"),
+            request.user.has_perm("offboarding.change_offboardinggeneralsetting"),
+            request.user.has_perm("attendance.change_attendancegeneralsetting"),
+            request.user.has_perm("payroll.change_payrollgeneralsetting"),
+            request.user.has_perm("employee.change_employeegeneralsetting"),
+            request.user.has_perm("payroll.change_encashmentgeneralsetting"),
+            request.user.has_perm("base.view_historytrackingfields"),
+            request.user.has_perm("payroll.view_payrollsettings"),
+        ]
+    )
+    employee_section = any(
+        [
+            request.user.has_perm("base.view_worktype"),
+            request.user.has_perm("base.view_rotatingworktype"),
+            request.user.has_perm("base.view_employeeshift"),
+            request.user.has_perm("base.view_rotatingshift"),
+            request.user.has_perm("base.view_employeeshiftschedule"),
+            request.user.has_perm("base.view_employeetype"),
+            request.user.has_perm("employee.view_actiontype"),
+            request.user.has_perm("employee.view_employeetag"),
+        ]
+    )
+
     return render(
         request,
         "base/general_settings.html",
@@ -5419,6 +5463,8 @@ def general_settings(request):
             "prefix_form": prefix_form,
             "companies": companies,
             "selected_company_id": selected_company_id,
+            "general_section": general_section,
+            "employee_section": employee_section,
         },
     )
 
@@ -6103,7 +6149,6 @@ def add_more_approval_managers(request):
     field_html = render_to_string(
         "multi_approval_condition/add_more_approval_manager.html", context
     )
-
     return HttpResponse(field_html)
 
 
@@ -6186,6 +6231,23 @@ def edit_approval_managers(form, managers):
                 widget=forms.Select(attrs={"class": "oh-select oh-select-2 mb-3"}),
                 required=False,
             )
+
+            form.initial[field_name] = manager.employee_id
+    return form
+
+
+def approval_managers_edit(form, managers):
+    for i, manager in enumerate(managers):
+        if i == 0:
+            form.initial["multi_approval_manager"] = manager.employee_id
+        else:
+            field_name = f"multi_approval_manager_{i}"
+            form.fields[field_name] = forms.ModelChoiceField(
+                queryset=Employee.objects.all(),
+                label=_("Approval Manager {}").format(i),
+                widget=forms.Select(attrs={"class": "oh-select oh-select-2 mb-3"}),
+                required=False,
+            )
             form.initial[field_name] = manager.employee_id
     return form
 
@@ -6251,10 +6313,28 @@ def multiple_level_approval_edit(request, condition_id):
 @login_required
 @permission_required("base.delete_multipleapprovalcondition")
 def multiple_level_approval_delete(request, condition_id):
+
+    request_copy = request.GET.copy()
+    request_copy.pop("instances_ids", None)
+    previous_data = request_copy.urlencode()
+
     condition = MultipleApprovalCondition.objects.get(id=condition_id)
     condition.delete()
     messages.success(request, _("Multiple approval condition deleted successfully"))
-    return redirect(hx_multiple_approval_condition)
+    hx_target = request.META.get("HTTP_HX_TARGET")
+    if hx_target and hx_target == "genericModalBody":
+        instances_ids = request.GET.get("instances_ids")
+        instances_list = json.loads(instances_ids)
+        if condition_id in instances_list:
+            instances_list.remove(condition_id)
+            previous_instance, next_instance = closest_numbers(
+                json.loads(instances_ids), condition_id
+            )
+        return redirect(
+            f"/detail-view-multiple-approval-condition/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
+        )
+
+    return redirect(reverse("hx-multiple-approval-condition"))
 
 
 @login_required
@@ -6793,115 +6873,16 @@ def dashboard_components_toggle(request):
     """
     This function is used to create personalized dashboard charts for employees
     """
-    employee_charts = DashboardEmployeeCharts.objects.get_or_create(
+    employee_charts, created = DashboardEmployeeCharts.objects.get_or_create(
         employee=request.user.employee_get
-    )[0]
+    )
     charts = employee_charts.charts or []
     chart_id = request.GET.get("chart_id")
-    if chart_id and chart_id not in charts:
-        charts.append(chart_id)
+    if chart_id and chart_id in charts:
+        charts.remove(chart_id)
         employee_charts.charts = charts
         employee_charts.save()
     return HttpResponse("")
-
-
-def check_chart_permission(request, charts):
-    """
-    This function is used to check the permissions for the charts
-    Args:
-        charts: dashboard charts
-    """
-    from base.templatetags.basefilters import is_reportingmanager
-
-    if apps.is_installed("recruitment"):
-        from recruitment.templatetags.recruitmentfilters import is_stagemanager
-
-        need_stage_manager = [
-            "hired_candidates",
-            "onboarding_candidates",
-            "recruitment_analytics",
-        ]
-    chart_apps = {
-        "offline_employees": "attendance",
-        "online_employees": "attendance",
-        "overall_leave_chart": "leave",
-        "hired_candidates": "recruitment",
-        "onboarding_candidates": "onboarding",
-        "recruitment_analytics": "recruitment",
-        "attendance_analytic": "attendance",
-        "hours_chart": "attendance",
-        "objective_status": "pms",
-        "key_result_status": "pms",
-        "feedback_status": "pms",
-        "shift_request_approve": "base",
-        "work_type_request_approve": "base",
-        "overtime_approve": "attendance",
-        "attendance_validate": "attendance",
-        "leave_request_approve": "leave",
-        "leave_allocation_approve": "leave",
-        "asset_request_approve": "asset",
-        "employees_chart": "employee",
-        "gender_chart": "employee",
-        "department_chart": "base",
-    }
-    permissions = {
-        "offline_employees": "employee.view_employee",
-        "online_employees": "employee.view_employee",
-        "overall_leave_chart": "leave.view_leaverequest",
-        "hired_candidates": "recruitment.view_candidate",
-        "onboarding_candidates": "recruitment.view_candidate",
-        "recruitment_analytics": "recruitment.view_recruitment",
-        "attendance_analytic": "attendance.view_attendance",
-        "hours_chart": "attendance.view_attendance",
-        "objective_status": "pms.view_employeeobjective",
-        "key_result_status": "pms.view_employeekeyresult",
-        "feedback_status": "pms.view_feedback",
-        "shift_request_approve": "base.change_shiftrequest",
-        "work_type_request_approve": "base.change_worktyperequest",
-        "overtime_approve": "attendance.change_attendance",
-        "attendance_validate": "attendance.change_attendance",
-        "leave_request_approve": "leave.change_leaverequest",
-        "leave_allocation_approve": "leave.change_leaveallocationrequest",
-        "asset_request_approve": "asset.change_assetrequest",
-    }
-    chart_list = []
-    need_reporting_manager = [
-        "offline_employees",
-        "online_employees",
-        "attendance_analytic",
-        "hours_chart",
-        "objective_status",
-        "key_result_status",
-        "feedback_status",
-        "shift_request_approve",
-        "work_type_request_approve",
-        "overtime_approve",
-        "attendance_validate",
-        "leave_request_approve",
-        "leave_allocation_approve",
-        "asset_request_approve",
-    ]
-    for chart in charts:
-        if apps.is_installed(chart_apps.get(chart[0])):
-            if (
-                chart[0] in permissions.keys()
-                or chart[0] in need_reporting_manager
-                or (apps.is_installed("recruitment") and chart[0] in need_stage_manager)
-            ):
-                if request.user.has_perm(permissions[chart[0]]):
-                    chart_list.append(chart)
-                elif chart[0] in need_reporting_manager:
-                    if is_reportingmanager(request.user):
-                        chart_list.append(chart)
-                elif (
-                    apps.is_installed("recruitment") and chart[0] in need_stage_manager
-                ):
-                    if is_stagemanager(request.user):
-                        chart_list.append(chart)
-            else:
-                chart_list.append(chart)
-
-    return chart_list
 
 
 @login_required
@@ -6909,51 +6890,56 @@ def employee_chart_show(request):
     """
     This function is used to choose which chart to show in the dashboard
     """
-    employee_charts = DashboardEmployeeCharts.objects.get_or_create(
+    employee_charts, created = DashboardEmployeeCharts.objects.get_or_create(
         employee=request.user.employee_get
-    )[0]
-    charts = [
-        ("offline_employees", _("Offline Employees")),
-        ("online_employees", _("Online Employees")),
-        ("overall_leave_chart", _("Overall Leave Chart")),
-        ("hired_candidates", _("Hired Candidates")),
-        ("onboarding_candidates", _("Onboarding Candidates")),
-        ("recruitment_analytics", _("Recruitment Analytics")),
-        ("attendance_analytic", _("Attendance analytics")),
-        ("hours_chart", _("Hours Chart")),
-        ("employees_chart", _("Employees Chart")),
-        ("department_chart", _("Department Chart")),
-        ("gender_chart", _("Gender Chart")),
-        ("objective_status", _("Objective Status")),
-        ("key_result_status", _("Key Result Status")),
-        ("feedback_status", _("Feedback Status")),
-        ("shift_request_approve", _("Shift Request to Approve")),
-        ("work_type_request_approve", _("Work Type Request to Approve")),
-        ("overtime_approve", _("Overtime to Approve")),
-        ("attendance_validate", _("Attendance to Validate")),
-        ("leave_request_approve", _("Leave Request to Approve")),
-        ("leave_allocation_approve", _("Leave Allocation to Approve")),
-        ("feedback_answer", _("Feedbacks to Answer")),
-        ("asset_request_approve", _("Asset Request to Approve")),
-    ]
-    charts = check_chart_permission(request, charts)
+    )
+
+    charts = check_chart_permission(request, CHARTS)
 
     if request.method == "POST":
-        employee_charts.charts = []
-        employee_charts.save()
-        data = request.POST
-        for chart in charts:
-            if chart[0] not in data.keys() and chart[0] not in employee_charts.charts:
-                employee_charts.charts.append(chart[0])
-            elif chart[0] in data.keys() and chart[0] in employee_charts.charts:
-                employee_charts.charts.remove(chart[0])
-            else:
-                pass
+        data = set(request.POST.keys())
+        current_order = employee_charts.charts or []
 
+        new_order = [c for c in current_order if c in data]
+
+        for char in data:
+            if char not in new_order:
+                new_order.append(char)
+
+        employee_charts.charts = new_order
         employee_charts.save()
+        messages.success(request, _("Dashboard charts updated successfully"))
+
         return HttpResponse("<script>window.location.reload();</script>")
+
     context = {"dashboard_charts": charts, "employee_chart": employee_charts.charts}
     return render(request, "dashboard_chart_form.html", context)
+
+
+@login_required
+def reorder_dashboard_charts(request):
+    """
+    This function is used to reorder the dashboard charts
+    """
+    employee_charts, created = DashboardEmployeeCharts.objects.get_or_create(
+        employee=request.user.employee_get
+    )
+    charts = [(chart, chart.replace("_", " ")) for chart in employee_charts.charts]
+
+    if request.method == "POST":
+        chart_keys = list(request.POST.keys())
+        filtered_chart_keys = [
+            item for item in chart_keys if item in employee_charts.charts
+        ]
+        employee_charts.charts = filtered_chart_keys
+        employee_charts.save()
+        return HttpResponse(headers={"HX-Refresh": "true"})
+
+    return render(
+        request,
+        "horilla_theme/components/reorder_dashboard_charts.html",
+        {"charts": charts},
+    )
 
 
 @login_required
@@ -6995,7 +6981,7 @@ def activate_biometric_attendance(request):
 
 @login_required
 def get_horilla_installed_apps(request):
-    return JsonResponse({"installed_apps": APPS})
+    return JsonResponse({"installed_apps": settings.APPS})
 
 
 def generate_error_report(error_list, error_data, file_name):
@@ -7035,7 +7021,7 @@ def generate_error_report(error_list, error_data, file_name):
     # Create a unique path for the error file download
     path_info = f"error-sheet-{uuid.uuid4()}"
     urlpatterns.append(path(path_info, get_error_sheet, name=path_info))
-    DYNAMIC_URL_PATTERNS.append(path_info)
+    settings.DYNAMIC_URL_PATTERNS.append(path_info)
     for key in error_data:
         error_data[key] = []
     return path_info
@@ -7121,8 +7107,10 @@ def csv_holiday_import(file):
     - "Recurring": Indicates whether the holiday recurs ("yes" or "no")
     """
     holiday_list, error_list = [], []
-    file_name = FILE_STORAGE.save("holiday_import.csv", ContentFile(file.read()))
-    holiday_file = FILE_STORAGE.path(file_name)
+    file_name = settings.FILE_STORAGE.save(
+        "holiday_import.csv", ContentFile(file.read())
+    )
+    holiday_file = settings.FILE_STORAGE.path(file_name)
 
     with open(holiday_file, errors="ignore") as csv_file:
         save = True
@@ -7269,6 +7257,8 @@ def holidays_info_import(request):
         "Recurring Field Error": [],
         "Other Errors": [],
     }
+
+    # is_hx_request = request.headers.get('HX-Request') == 'true'
 
     if request.method == "POST":
         file = request.FILES.get("holidays_import")
@@ -7646,9 +7636,49 @@ def view_penalties(request):
     return render(request, "penalty/penalty_view.html", {"records": records})
 
 
-from rest_framework_simplejwt.authentication import JWTAuthentication
-from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
-from rest_framework_simplejwt.tokens import UntypedToken
+@login_required
+@permission_required("base.delete_penaltyaccounts")
+def delete_penalities(request, penalty_id):
+    penalty = PenaltyAccounts.objects.get(id=penalty_id)
+    penalty.delete()
+    messages.success(request, _("Penalty deleted suucessfully"))
+    return HttpResponse(
+        "<script>$('.reload-record').click();$('#reloadMessagesButton').click();</script>"
+    )
+
+
+@method_decorator(login_required, name="dispatch")
+@method_decorator(
+    permission_required("horilla_meet.view_googlecloudcredential"), name="dispatch"
+)
+class EnableIntegrationsView(View):
+    """Handles enabling/disabling Google Meet integration dynamically."""
+
+    def post(self, request, *args, **kwargs):
+        """Handles POST request to enable/disable an integration app."""
+        app_label = request.GET.get("app_label")
+
+        if not app_label:
+            messages.error(request, "Missing app_label")
+            return HttpResponse("<script>window.location.reload()</script>")
+
+        enabled = request.POST.get("is_enabled") is not None
+        integration_app, created = IntegrationApps.objects.update_or_create(
+            app_label=app_label,
+            defaults={"is_enabled": enabled},
+        )
+        try:
+            app_config = apps.get_app_config(app_label)
+            app_verbose_name = app_config.verbose_name
+        except LookupError:
+            app_verbose_name = app_label
+
+        if enabled:
+            messages.success(request, f"{app_verbose_name} enabled")
+        else:
+            messages.error(request, f"{app_verbose_name} disabled")
+
+        return HttpResponse("<script>window.location.reload()</script>")
 
 
 def is_jwt_token_valid(auth_header):

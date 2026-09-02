@@ -27,7 +27,6 @@ from datetime import date, datetime
 from typing import Any
 
 from django import forms
-from django.contrib.auth.models import User
 from django.db.models import Q
 from django.forms import DateInput, TextInput
 from django.template.loader import render_to_string
@@ -51,6 +50,7 @@ from employee.models import (
 )
 from horilla import horilla_middlewares
 from horilla_audit.models import AccountBlockUnblock
+from horilla_auth.models import HorillaUser
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class ModelForm(forms.ModelForm):
         now = datetime.now()
 
         default_input_class = "oh-input w-100"
-        select_class = "oh-select oh-select-2"
+        select_class = "oh-select"
         checkbox_class = "oh-switch__checkbox"
 
         for field_name, field in self.fields.items():
@@ -174,7 +174,7 @@ class ModelForm(forms.ModelForm):
 
 class UserForm(ModelForm):
     """
-    Form for User model
+    Form for HorillaUser model
     """
 
     class Meta:
@@ -183,12 +183,12 @@ class UserForm(ModelForm):
         """
 
         fields = ("groups",)
-        model = User
+        model = HorillaUser
 
 
 class UserPermissionForm(ModelForm):
     """
-    Form for User model
+    Form for HorillaUser model
     """
 
     class Meta:
@@ -197,7 +197,7 @@ class UserPermissionForm(ModelForm):
         """
 
         fields = ("groups", "user_permissions")
-        model = User
+        model = HorillaUser
 
 
 class EmployeeForm(ModelForm):
@@ -219,6 +219,9 @@ class EmployeeForm(ModelForm):
             "is_directly_converted",
             "is_active",
         )
+        widgets = {
+            "dob": TextInput(attrs={"type": "date", "id": "dob"}),
+        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -353,6 +356,11 @@ class EmployeeWorkInformationForm(ModelForm):
         fields = "__all__"
         exclude = ("employee_id", "additional_info", "experience")
 
+        widgets = {
+            "date_joining": DateInput(attrs={"type": "date"}),
+            "contract_end_date": DateInput(attrs={"type": "date"}),
+        }
+
     def __init__(self, *args, disable=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["email"].widget.attrs["autocomplete"] = "email"
@@ -401,7 +409,7 @@ class EmployeeWorkInformationForm(ModelForm):
                             initial=field.initial,
                             widget=forms.Select(
                                 attrs={
-                                    "class": "oh-select oh-select-2",
+                                    "class": "oh-select",
                                     "onchange": f'onDynamicCreate(this.value,"{urls.get(field.label)}");',
                                 }
                             ),
@@ -432,8 +440,52 @@ class EmployeeWorkInformationUpdateForm(ModelForm):
         """
 
         model = EmployeeWorkInformation
-        fields = "__all__"
-        exclude = ("employee_id",)
+        # fields = "__all__"
+        fields = [
+            "department_id",
+            "job_position_id",
+            "job_role_id",
+            "work_type_id",
+            "employee_type_id",
+            "reporting_manager_id",
+            "company_id",
+            "tags",
+            "location",
+            "email",
+            "mobile",
+            "shift_id",
+            "date_joining",
+            "contract_end_date",
+            "basic_salary",
+            "salary_hour",
+        ]
+        exclude = ("employee_id", "experience", "additional_info")
+
+        widgets = {
+            "date_joining": DateInput(attrs={"type": "date"}),
+            "contract_end_date": DateInput(attrs={"type": "date"}),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["department_id"].widget.attrs.update(
+            {
+                "hx-target": "#id_job_position_id_parent_div",
+                "hx-include": "#id_job_position_id",
+                "hx-trigger": "change,load",
+                "hx-swap": "innerHTML",
+                "hx-get": "/employee/get-job-positions-hx",
+            }
+        )
+        self.fields["job_position_id"].widget.attrs.update(
+            {
+                "hx-target": "#id_job_role_id_parent_div",
+                "hx-include": "#id_job_role_id",
+                "hx-trigger": "change,load",
+                "hx-swap": "innerHTML",
+                "hx-get": "/employee/get-job-roles-hx",
+            }
+        )
 
     def as_p(self, *args, **kwargs):
         context = {"form": self}
@@ -601,7 +653,7 @@ class BulkUpdateFieldForm(forms.Form):
         ]
         self.fields["update_fields"].choices = updated_choices
         for visible in self.visible_fields():
-            visible.field.widget.attrs["class"] = "oh-select oh-select-2 oh-input w-100"
+            visible.field.widget.attrs["class"] = "oh-select oh-input w-100"
 
 
 class EmployeeNoteForm(ModelForm):
@@ -667,6 +719,8 @@ class PolicyForm(ModelForm):
     PolicyForm
     """
 
+    cols = {"title": 12, "body": 12, "is_visible_to_all": 12, "company_id": 12}
+
     class Meta:
         model = Policy
         fields = "__all__"
@@ -680,7 +734,7 @@ class PolicyForm(ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["attachment"] = MultipleFileField(
-            label=trans("Attachments"), required=False
+            label="Attachements", required=False
         )
 
     def save(self, *args, commit=True, **kwargs):
@@ -733,13 +787,16 @@ class DisciplinaryActionForm(ModelForm):
         model = DisciplinaryAction
         fields = "__all__"
         exclude = ["objects", "is_active"]
+        widgets = {
+            "start_date": forms.DateInput(attrs={"type": "date"}),
+        }
 
     action = forms.ModelChoiceField(
         queryset=Actiontype.objects.all(),
         label=_("Action"),
         widget=forms.Select(
             attrs={
-                "class": "oh-select oh-select-2",
+                "class": "oh-select",
                 "onchange": "actionTypeChange($(this))",
             }
         ),
@@ -764,6 +821,9 @@ class DisciplinaryActionForm(ModelForm):
 
 
 class ActiontypeForm(ModelForm):
+
+    cols = {"title": 12, "action_type": 12}
+
     class Meta:
         model = Actiontype
         fields = "__all__"

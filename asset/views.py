@@ -10,6 +10,7 @@ from datetime import date, datetime
 from urllib.parse import parse_qs
 
 import pandas as pd
+from django.conf import settings
 from django.contrib import messages
 from django.core.files.base import ContentFile
 from django.core.files.storage import FileSystemStorage
@@ -70,7 +71,6 @@ from horilla.decorators import (
     permission_required,
 )
 from horilla.group_by import group_by_queryset
-from horilla.horilla_settings import HORILLA_DATE_FORMATS
 from horilla.methods import horilla_users_with_perms
 from notifications.signals import notify
 
@@ -317,6 +317,19 @@ def asset_delete(request, asset_id):
         )
     else:
         asset_del(request, asset)
+
+        if request.GET.get("instance_ids"):
+            instances_ids = request.GET.get("instance_ids")
+            instances_list = json.loads(instances_ids)
+            if asset_id in instances_list:
+                instances_list.remove(asset_id)
+            previous_instance, next_instance = closest_numbers(
+                json.loads(instances_ids), asset_id
+            )
+            return redirect(
+                f"/asset/asset-information/{next_instance}/?{previous_data}&instance_ids={instances_list}&asset_info=true"
+            )
+
         if len(eval_validate(instances_ids)) <= 1:
             return HttpResponse("<script>window.location.reload();</script>")
 
@@ -755,8 +768,7 @@ def asset_allocate_creation(request):
     if request.method == "POST":
         form = AssetAllocationForm(request.POST)
         if form.is_valid():
-            asset = form.instance.asset_id.id
-            asset = Asset.objects.filter(id=asset).first()
+            asset = form.instance.asset_id
             asset.asset_status = "In use"
             asset.save()
             instance = form.save()
@@ -859,7 +871,7 @@ def asset_allocate_return(request, asset_id):
                     asset_allocation.return_images.add(*attachments)
                 asset.asset_status = "Available"
                 asset.save()
-                messages.info(request, _("Asset Return Successful !."))
+                messages.success(request, _("Asset Returned Successfully..."))
                 return HttpResponse(
                     response.content.decode("utf-8")
                     + "<script>location.reload();</script>"
@@ -1361,7 +1373,10 @@ def asset_export_excel(request):
                     start_date = datetime.strptime(str(value), "%Y-%m-%d").date()
 
                     # The formatted date for each format
-                    for format_name, format_string in HORILLA_DATE_FORMATS.items():
+                    for (
+                        format_name,
+                        format_string,
+                    ) in settings.HORILLA_DATE_FORMATS.items():
                         if format_name == date_format:
                             value = start_date.strftime(format_string)
 
@@ -1510,6 +1525,9 @@ def asset_batch_number_delete(request, batch_id):
     Returns:
     - message of the return
     """
+    request_copy = request.GET.copy()
+    request_copy.pop("requests_ids", None)
+    previous_data = request_copy.urlencode()
     previous_data = request.GET.urlencode()
     try:
         asset_batch_number = AssetLot.objects.get(id=batch_id)
@@ -1518,7 +1536,7 @@ def asset_batch_number_delete(request, batch_id):
         )
         if assigned_batch_number:
             messages.error(request, _("Batch number in-use"))
-            return redirect(f"/asset/asset-batch-number-search?{previous_data}")
+            return redirect(f"/asset/asset-batch-list?{previous_data}")
         asset_batch_number.delete()
         messages.success(request, _("Batch number deleted"))
     except AssetLot.DoesNotExist:
@@ -1805,7 +1823,7 @@ def asset_history_search(request):
 
 @login_required
 @owner_can_enter("asset.view_asset", Employee)
-def asset_tab(request, emp_id):
+def asset_tab(request, pk):
     """
     This function is used to view asset tab of an employee in employee individual view.
 
@@ -1816,7 +1834,7 @@ def asset_tab(request, emp_id):
     Returns: return asset-tab template
 
     """
-    employee = Employee.objects.get(id=emp_id)
+    employee = Employee.objects.get(id=pk)
     assets_requests = employee.requested_employee.all()
     assets = employee.allocated_employee.all()
     assets_ids = (
@@ -1826,9 +1844,9 @@ def asset_tab(request, emp_id):
         "assets": assets,
         "requests": assets_requests,
         "assets_ids": assets_ids,
-        "employee": emp_id,
+        "employee": pk,
     }
-    return render(request, "tabs/asset-tab.html", context=context)
+    return render(request, "tabs/main_asset_tab.html", context=context)
 
 
 @login_required

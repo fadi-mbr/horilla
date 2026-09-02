@@ -26,7 +26,6 @@ import fitz  # type: ignore
 from django import template
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth.models import User
 from django.core import serializers
 from django.core.cache import cache as CACHE
 from django.core.mail import EmailMessage
@@ -63,10 +62,12 @@ from horilla.decorators import (
     permission_required,
 )
 from horilla.group_by import group_by_queryset
+from horilla_auth.models import HorillaUser
 from horilla_documents.models import Document
 from notifications.signals import notify
 from recruitment.auth import CandidateAuthenticationBackend
 from recruitment.decorators import (
+    all_manager_can_enter,
     candidate_login_required,
     manager_can_enter,
     recruitment_manager_can_enter,
@@ -110,6 +111,7 @@ from recruitment.models import (
     Recruitment,
     RecruitmentGeneralSetting,
     RecruitmentSurvey,
+    RejectedCandidate,
     RejectReason,
     Resume,
     Skill,
@@ -630,10 +632,7 @@ def candidate_component(request):
     ].filter(stage_id=stage)
 
     template = "pipeline/components/candidate_stage_component.html"
-    if (
-        CACHE.get(request.session.session_key + "pipeline")["filter_query"].get("view")
-        == "card"
-    ):
+    if request.GET.get("view") == "card":
         template = "pipeline/kanban_components/candidate_kanban_components.html"
 
     now = timezone.now()
@@ -924,7 +923,7 @@ def candidate_stage_update(request, cand_id):
 
 @login_required
 @hx_request_required
-@manager_can_enter(perm="recruitment.view_stagenote")
+@all_manager_can_enter(perm="recruitment.view_stagenote")
 def view_note(request, cand_id):
     """
     This method renders a template components to view candidate remark or note
@@ -943,11 +942,11 @@ def view_note(request, cand_id):
 @login_required
 @hx_request_required
 @manager_can_enter(perm="recruitment.add_stagenote")
-def add_note(request, cand_id=None):
+def add_note(request, pk=None):
     """
     This method renders template component to add candidate remark
     """
-    form = StageNoteForm(initial={"candidate_id": cand_id})
+    form = StageNoteForm(initial={"candidate_id": pk})
     if request.method == "POST":
         form = StageNoteForm(
             request.POST,
@@ -955,17 +954,17 @@ def add_note(request, cand_id=None):
         )
         if form.is_valid():
             note, attachment_ids = form.save(commit=False)
-            candidate = Candidate.objects.get(id=cand_id)
+            candidate = Candidate.objects.get(id=pk)
             note.candidate_id = candidate
             note.stage_id = candidate.stage_id
             note.updated_by = request.user.employee_get
             note.save()
             note.stage_files.set(attachment_ids)
             messages.success(request, _("Note added successfully.."))
-    candidate_obj = Candidate.objects.get(id=cand_id)
+    candidate_obj = Candidate.objects.get(id=pk)
     return render(
         request,
-        "candidate/individual_view_note.html",
+        "cbv/candidates/profile_notes_tab.html",
         {
             "candidate": candidate_obj,
             "note_form": form,
@@ -1282,6 +1281,39 @@ def stage_update(request, stage_id):
 
 
 @login_required
+@recruitment_manager_can_enter("recruitment.change_stage")
+def update_stage_order(request, pk):
+    """
+    This method is used to update the stage sequence of the onboarding
+    """
+    recruitment = Recruitment.objects.get(id=pk)
+
+    if request.method == "POST":
+        try:
+            order = json.loads(request.POST.get("order", "[]"))
+            for index, stage_id in enumerate(order):
+                stage = recruitment.stage_set.get(id=stage_id)
+                stage.sequence = index + 1
+                stage.save()
+            messages.success(request, "Sequence Updated Successfully")
+            return JsonResponse({"status": "success"})
+        except Exception as e:
+            messages.error(request, "Error Updating Sequence..")
+            return JsonResponse({"status": "error", "message": str(e)}, status=400)
+
+    stages = recruitment.stage_set.order_by("sequence")
+
+    return render(
+        request,
+        "cbv/pipeline/stage_order.html",
+        {
+            "stages": stages,
+            "recruitment": recruitment,
+        },
+    )
+
+
+@login_required
 @hx_request_required
 @manager_can_enter("recruitment.add_candidate")
 def add_candidate(request):
@@ -1388,9 +1420,9 @@ def candidate_view(request):
     recruitments = Recruitment.objects.filter(closed=False, is_active=True)
 
     mails = list(Candidate.objects.values_list("email", flat=True))
-    # Query the User model to check if any email is present
+    # Query the HorillaUser model to check if any email is present
     existing_emails = list(
-        User.objects.filter(username__in=mails).values_list("email", flat=True)
+        HorillaUser.objects.filter(username__in=mails).values_list("email", flat=True)
     )
 
     filter_obj = CandidateFilter(request.GET, queryset=candidates)
@@ -1504,7 +1536,8 @@ def interview_employee_remove(request, interview_id, employee_id):
     interview.employee_id.remove(employee_id)
     messages.success(request, "Interviewer removed succesfully.")
     interview.save()
-    return HttpResponse("<script>$('.filterButton')[0].click()</script>")
+    # return redirect(interview_filter_view)
+    return HttpResponse("<script> $('#applyFilter').click();</script>")
 
 
 @login_required
@@ -1574,70 +1607,243 @@ def candidate_view_card(request):
 
 @login_required
 @manager_can_enter(perm="recruitment.view_candidate")
+def candidate_about_tab(request, pk, **kwargs):
+    """
+    method for rendering about tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    if not candidate_obj:
+        messages.error(request, _("Candidate not found"))
+        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    return render(
+        request,
+        "cbv/candidates/profile_about_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@manager_can_enter(perm="recruitment.view_candidate")
+def candidate_resume_tab(request, pk, **kwargs):
+    """
+    method for rendering resume tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "cbv/candidates/profile_resume_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@manager_can_enter(perm="recruitment.view_candidate")
+def candidate_survey_tab(request, pk, **kwargs):
+    """
+    method for rendering survey tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "cbv/candidates/profile_survey_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@manager_can_enter(perm="recruitment.view_candidate")
+def candidate_document_request_tab(request, pk, **kwargs):
+    """
+    method for rendering survey tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    documents = candidate_obj.candidatedocument_set.all()
+    return render(
+        request,
+        "candidate/document.html",
+        {
+            "candidate": candidate_obj,
+            "documents": documents,
+        },
+    )
+
+
+# @login_required
+# @manager_can_enter(perm="recruitment.view_candidate")
+# def candidate_notes_tab(request, pk, **kwargs):
+#     """
+#     method for rendering notes tab
+#     """
+
+#     candidate_obj = Candidate.find(pk)
+#     return render(
+#         request,
+#         "candidate/individual_view_note.html",
+#         {
+#             "candidate": candidate_obj,
+#         },
+#     )
+
+
+@login_required
+@manager_can_enter(perm="recruitment.view_candidate")
+def candidate_history_tab(request, pk, **kwargs):
+    """
+    method for rendering history tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "candidate/history.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@all_manager_can_enter(perm="recruitment.view_candidate")
+def candidate_onboarding_tab(request, pk, **kwargs):
+    """
+    method for rendering onboarding tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "cbv/candidates/profile_onboarding_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@all_manager_can_enter(perm="recruitment.view_candidate")
+def candidate_rating_tab(request, pk, **kwargs):
+    """
+    method for rendering rating tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "candidate/rating_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+@login_required
+@manager_can_enter(perm="recruitment.view_candidate")
+def candidate_interview_tab(request, pk, **kwargs):
+    """
+    method for rendering interview tab
+    """
+
+    candidate_obj = Candidate.find(pk)
+    return render(
+        request,
+        "cbv/candidates/profile_interview_tab.html",
+        {
+            "candidate": candidate_obj,
+        },
+    )
+
+
+def scheduled_interview_tab(request, pk, **kwargs):
+    """
+    method for rendering interview tab
+    """
+    employee = Employee.objects.get(id=pk)
+    interviews = InterviewSchedule.objects.filter(employee_id=employee).order_by(
+        "-interview_date"
+    )
+    return render(
+        request,
+        "tabs/scheduled_interview.html",
+        {"interviews": interviews, "employee": employee},
+    )
+
+
+@login_required
+@all_manager_can_enter(perm="recruitment.view_candidate")
 def candidate_view_individual(request, cand_id, **kwargs):
     """
     This method is used to view profile of candidate.
     """
-    candidate_obj = Candidate.find(cand_id)
-    if not candidate_obj:
-        messages.error(request, _("Candidate not found"))
-        return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    # candidate_obj = Candidate.find(cand_id)
+    # # if not candidate_obj:
+    # #     messages.error(request, _("Candidate not found"))
+    # #     return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
-    mails = list(Candidate.objects.values_list("email", flat=True))
-    # Query the User model to check if any email is present
-    existing_emails = list(
-        User.objects.filter(username__in=mails).values_list("email", flat=True)
-    )
-    ratings = candidate_obj.candidate_rating.all()
-    documents = CandidateDocument.objects.filter(candidate_id=cand_id)
-    rating_list = []
-    avg_rate = 0
-    for rating in ratings:
-        rating_list.append(rating.rating)
-    if len(rating_list) != 0:
-        avg_rate = round(sum(rating_list) / len(rating_list))
+    # mails = list(Candidate.objects.values_list("email", flat=True))
+    # # Query the HorillaUser model to check if any email is present
+    # existing_emails = list(
+    #     HorillaUser.objects.filter(username__in=mails).values_list("email", flat=True)
+    # )
+    # ratings = candidate_obj.candidate_rating.all()
+    # documents = CandidateDocument.objects.filter(candidate_id=cand_id)
+    # rating_list = []
+    # avg_rate = 0
+    # for rating in ratings:
+    #     rating_list.append(rating.rating)
+    # if len(rating_list) != 0:
+    #     avg_rate = round(sum(rating_list) / len(rating_list))
 
-    # Retrieve the filtered candidate from the session
-    filtered_candidate_ids = request.session.get("filtered_candidates", [])
+    # # Retrieve the filtered candidate from the session
+    # filtered_candidate_ids = request.session.get("filtered_candidates", [])
 
-    # Convert the string to an actual list of integers
-    requests_ids = (
-        ast.literal_eval(filtered_candidate_ids)
-        if isinstance(filtered_candidate_ids, str)
-        else filtered_candidate_ids
-    )
+    # # Convert the string to an actual list of integers
+    # requests_ids = (
+    #     ast.literal_eval(filtered_candidate_ids)
+    #     if isinstance(filtered_candidate_ids, str)
+    #     else filtered_candidate_ids
+    # )
 
-    next_id = None
-    previous_id = None
+    # next_id = None
+    # previous_id = None
 
-    for index, req_id in enumerate(requests_ids):
-        if req_id == cand_id:
+    # for index, req_id in enumerate(requests_ids):
+    #     if req_id == cand_id:
 
-            if index == len(requests_ids) - 1:
-                next_id = None
-            else:
-                next_id = requests_ids[index + 1]
-            if index == 0:
-                previous_id = None
-            else:
-                previous_id = requests_ids[index - 1]
-            break
+    #         if index == len(requests_ids) - 1:
+    #             next_id = None
+    #         else:
+    #             next_id = requests_ids[index + 1]
+    #         if index == 0:
+    #             previous_id = None
+    #         else:
+    #             previous_id = requests_ids[index - 1]
+    #         break
 
-    now = timezone.now()
+    # now = timezone.now()
 
     return render(
         request,
         "candidate/individual.html",
-        {
-            "candidate": candidate_obj,
-            "previous": previous_id,
-            "next": next_id,
-            "requests_ids": requests_ids,
-            "emp_list": existing_emails,
-            "average_rate": avg_rate,
-            "documents": documents,
-            "now": now,
-        },
+        # {
+        #     "candidate": candidate_obj,
+        #     "previous": previous_id,
+        #     "next": next_id,
+        #     "requests_ids": requests_ids,
+        #     "emp_list": existing_emails,
+        #     "average_rate": avg_rate,
+        #     "documents": documents,
+        #     "now": now,
+        # },
     )
 
 
@@ -1702,7 +1908,7 @@ def candidate_conversion(request, cand_id, **kwargs):
         messages.info(request, "This candidate is already converted to an employee.")
         return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
 
-    user_exists = User.objects.filter(username=candidate_obj.email).exists()
+    user_exists = HorillaUser.objects.filter(username=candidate_obj.email).exists()
     employee_exists = Employee.objects.filter(
         employee_user_id__username=candidate_obj.email
     ).exists()
@@ -1924,11 +2130,7 @@ def interview_delete(request, interview_id):
     except:
         messages.error(request, _("Scheduled Interview not found"))
 
-    return HttpResponse(
-        "<script>$('.filterButton')[0].click()</script>"
-        if view == "true"
-        else "<script>window.location.reload()</script>"
-    )
+    return HttpResponse("<script>window.location.reload()</script>")
 
 
 @login_required
@@ -1981,6 +2183,25 @@ def interview_edit(request, interview_id):
             "interview_id": interview_id,
             "view": view,
         },
+    )
+
+
+def get_interview_managers(request):
+    cand_id = request.GET.get("candidate_id")
+    form = ScheduleInterviewForm()
+    candidate_obj = Candidate.objects.get(id=cand_id)
+
+    managers = candidate_obj.recruitment_id.recruitment_managers.all()
+
+    form.fields["employee_id"].queryset = managers
+    pk = request.GET.get("pk")
+    if pk:
+        interviewer = InterviewSchedule.objects.get(id=pk)
+        form.fields["employee_id"].initial = interviewer.employee_id.all()
+    return render(
+        request,
+        "candidate/interview_form.html",
+        {"form": form, "CBV": True},
     )
 
 
@@ -2662,16 +2883,23 @@ def recruitment_details(request, id):
 
 @login_required
 @manager_can_enter("recruitment.view_candidate")
-def get_mail_log(request):
+def get_mail_log(request, pk):
     """
     This method is used to track mails sent along with the status
     """
-    candidate_id = request.GET["candidate_id"]
-    candidate = Candidate.objects.get(id=candidate_id)
-    tracked_mails = EmailLog.objects.filter(to__icontains=candidate.email).order_by(
+
+    candidate_obj = Candidate.find(pk)
+    tracked_mails = EmailLog.objects.filter(to__icontains=candidate_obj.email).order_by(
         "-created_at"
     )
-    return render(request, "candidate/mail_log.html", {"tracked_mails": tracked_mails})
+    return render(
+        request,
+        "candidate/mail_log.html",
+        {
+            "candidate": candidate_obj,
+            "tracked_mails": tracked_mails,
+        },
+    )
 
 
 @login_required
@@ -2683,9 +2911,15 @@ def candidate_self_tracking(request):
     """
     settings = RecruitmentGeneralSetting.objects.first()
     settings = settings if settings else RecruitmentGeneralSetting()
-    settings.candidate_self_tracking = "candidate_self_tracking" in request.GET.keys()
+    if request.GET.get("candidate_self_tracking") == "true":
+        settings.candidate_self_tracking = True
+        message = _("Application Tracking is enabled ")
+    else:
+        settings.candidate_self_tracking = False
+        message = _("Application Tracking is disabled ")
     settings.save()
-    return HttpResponse("success")
+    messages.success(request, message)
+    return HttpResponse("<script>$('#reloadMessagesButton').click()</script>")
 
 
 @login_required
@@ -2697,9 +2931,16 @@ def candidate_self_tracking_rating_option(request):
     """
     settings = RecruitmentGeneralSetting.objects.first()
     settings = settings if settings else RecruitmentGeneralSetting()
-    settings.show_overall_rating = "candidate_self_tracking" in request.GET.keys()
+    if request.GET.get("candidate_self_tracking") == "true":
+        settings.show_overall_rating = True
+        message = _("Rating visibility is enabled ")
+    else:
+        settings.show_overall_rating = False
+        message = _("Rating visibility is disabled ")
     settings.save()
-    return HttpResponse("success")
+    messages.success(request, message)
+    settings.save()
+    return HttpResponse("<script>$('#reloadMessagesButton').click()</script>")
 
 
 def candidate_login(request):
@@ -2838,12 +3079,14 @@ def delete_reject_reason(request):
     """
     This method is used to delete the reject reasons
     """
-    ids = request.GET.getlist("ids")
-    reasons = RejectReason.objects.filter(id__in=ids)
-    for reason in reasons:
-        reasons.delete()
-        messages.success(request, f"{reason.title} is deleted.")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+    id = request.GET.get("id")
+    reason = RejectReason.objects.get(id=id)
+    count = RejectReason.objects.count()
+    reason.delete()
+    messages.success(request, f"{reason.title} is deleted.")
+    if count == 1:
+        return HttpResponse("<script>$('.reload-record').click();</script>")
+    return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
 
 
 def extract_text_with_font_info(pdf):
@@ -3083,16 +3326,21 @@ def create_skills(request):
 
 @login_required
 @permission_required("recruitment.delete_rejectreason")
-def delete_skills(request):
+def delete_skills(request, id=None):
     """
     This method is used to delete the skills
     """
+
     ids = request.GET.getlist("ids")
     skills = Skill.objects.filter(id__in=ids)
     for skill in skills:
+        count = Skill.objects.count
         skill.delete()
         messages.success(request, f"{skill.title} is deleted.")
-    return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
+        if count == 0:
+            return HttpResponse("<script>$('#reloadMessagesButton').click()</script>")
+        else:
+            return HttpResponse("<script>$('.reload-record').click()</script>")
 
 
 @login_required
@@ -3614,3 +3862,22 @@ def employee_profile_interview_tab(request):
     ).order_by("is_today", "-interview_date", "interview_time")
 
     return render(request, "tabs/scheduled_interview.html", {"interviews": interviews})
+
+
+@login_required
+@hx_request_required
+@permission_required("recruitment.delete_rejectedcandidate")
+def delete_candidate_rejection(request, rej_id):
+    """
+    This method is used to delete candidate rejection
+    """
+    try:
+        instance = RejectedCandidate.objects.filter(id=rej_id).first()
+        if instance:
+            instance.delete()
+            messages.success(request, "Candidate rejection deleted successfully")
+        else:
+            messages.error(request, "Candidate rejection not found")
+    except Exception as e:
+        messages.error(request, "Error occurred while deleting candidate rejection")
+    return HttpResponse("<script>window.location.reload()</script>")

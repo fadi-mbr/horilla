@@ -14,7 +14,6 @@ provide the main entry points for interacting with the application's functionali
 import logging
 import uuid
 
-from horilla.horilla_settings import DYNAMIC_URL_PATTERNS, HORILLA_DATE_FORMATS
 from horilla.methods import remove_dynamic_url
 
 logger = logging.getLogger(__name__)
@@ -23,11 +22,13 @@ import calendar
 import contextlib
 import io
 import json
+import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
+from django.conf import settings
 from django.contrib import messages
 from django.core.paginator import Paginator
 from django.core.validators import validate_ipv46_address
@@ -48,6 +49,7 @@ from django.utils.timezone import now
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
 from django.views.decorators.http import require_http_methods
+from xlsxwriter.utility import xl_range
 
 from attendance.filters import (
     AttendanceActivityFilter,
@@ -173,7 +175,7 @@ def profile_attendance_tab(request):
 
 @login_required
 @manager_can_enter("employee.view_employee")
-def attendance_tab(request, emp_id):
+def attendance_tab(request, pk):
     """
     This function is used to view attendance tab of an employee in individual view.
 
@@ -186,16 +188,16 @@ def attendance_tab(request, emp_id):
 
     requests = Attendance.objects.filter(
         is_validate_request=True,
-        employee_id=emp_id,
+        employee_id=pk,
     )
     attendances_ids = json.dumps([instance.id for instance in requests])
     validate_attendances = Attendance.objects.filter(
-        attendance_validated=False, employee_id=emp_id
+        attendance_validated=False, employee_id=pk
     )
     validate_attendances_ids = json.dumps(
         [instance.id for instance in validate_attendances]
     )
-    accounts = AttendanceOverTime.objects.filter(employee_id=emp_id)
+    accounts = AttendanceOverTime.objects.filter(employee_id=pk)
     accounts_ids = json.dumps([instance.id for instance in accounts])
 
     context = {
@@ -729,6 +731,7 @@ def attendance_overtime_delete(request, obj_id):
     hx_target = request.META.get("HTTP_HX_TARGET", None)
     try:
         attendance = AttendanceOverTime.objects.get(id=obj_id)
+        employee_id = attendance.employee_id.id
         attendance.delete()
         if hx_target == "ot-table":
             messages.success(request, _("Hour account deleted."))
@@ -741,7 +744,17 @@ def attendance_overtime_delete(request, obj_id):
     if hx_target and hx_target == "ot-table":
         hour_account = AttendanceOverTime.objects.all()
         if hour_account.exists():
-            return redirect(f"/attendance/attendance-overtime-search?{previous_data}")
+            path = request.META.get("HTTP_HX_CURRENT_URL", None)
+            parsed_url = urlparse(path)
+            parsed_path = parsed_url.path.lstrip("/")
+            if parsed_path == "attendance/attendance-overtime-view/":
+                return redirect(
+                    f"/attendance/attendance-overtime-search?{previous_data}"
+                )
+            else:
+                return redirect(
+                    f"/attendance/attendance-overtime-individual-tab/{employee_id}/?deleted=true"
+                )
         else:
             return HttpResponse("<script>window.location.reload()</script>")
     elif hx_target:
@@ -774,6 +787,50 @@ def attendance_account_bulk_delete(request):
                 _("You cannot delete {hour_account}").format(hour_account=hour_account),
             )
     return JsonResponse({"message": "Success"})
+
+
+@login_required
+def form_shift_dynamic_data(request):
+    """
+    This method is used to update the shift details to the form
+    """
+    shift_id = request.POST["shift_id"]
+    attendance_date_str = request.POST.get("attendance_date")
+    today = datetime.now()
+    attendance_date = date(day=today.day, month=today.month, year=today.year)
+    if attendance_date_str is not None and attendance_date_str != "":
+        attendance_date = datetime.strptime(attendance_date_str, "%Y-%m-%d").date()
+    day = attendance_date.strftime("%A").lower()
+    schedule_today = EmployeeShiftSchedule.objects.filter(
+        shift_id__id=shift_id, day__day=day
+    ).first()
+    shift_start_time = ""
+    shift_end_time = ""
+    minimum_hour = "00:00"
+    attendance_clock_out_date = attendance_date
+    if schedule_today is not None:
+        shift_start_time = schedule_today.start_time
+        shift_end_time = schedule_today.end_time
+        minimum_hour = schedule_today.minimum_working_hour
+        if shift_end_time < shift_start_time:
+            attendance_clock_out_date = attendance_date + timedelta(days=1)
+    worked_hour = minimum_hour
+    if attendance_date == date(day=today.day, month=today.month, year=today.year):
+        shift_end_time = datetime.now().strftime("%H:%M")
+        worked_hour = "00:00"
+
+    minimum_hour = attendance_day_checking(str(attendance_date), minimum_hour)
+
+    return JsonResponse(
+        {
+            "shift_start_time": shift_start_time,
+            "shift_end_time": shift_end_time,
+            "checkin_date": attendance_date.strftime("%Y-%m-%d"),
+            "minimum_hour": minimum_hour,
+            "worked_hour": worked_hour,
+            "checkout_date": attendance_clock_out_date.strftime("%Y-%m-%d"),
+        }
+    )
 
 
 @login_required
@@ -849,7 +906,7 @@ def activity_single_view(request, obj_id):
 def attendance_activity_delete(request, obj_id):
     """
     This method is used to delete attendance activity
-    args:
+    args:attendance-activity-delete
         obj_id : attendance activity id
     """
     request_copy = request.GET.copy()
@@ -862,6 +919,7 @@ def attendance_activity_delete(request, obj_id):
         messages.error(request, _("Attendance activity Does not exists.."))
     except ProtectedError:
         messages.error(request, _("You cannot delete this activity"))
+
     if not request.GET.get("instances_ids"):
         return redirect(f"/attendance/attendance-activity-search?{previous_data}")
     else:
@@ -873,7 +931,7 @@ def attendance_activity_delete(request, obj_id):
             json.loads(instances_ids), obj_id
         )
         return redirect(
-            f"/attendance/attendance-activity-single-view/{next_instance}/?{previous_data}&instances_ids={instances_list}"
+            f"/attendance/attendance-activity-single-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
         )
 
 
@@ -1027,7 +1085,7 @@ def handle_activity_import_error(error_data):
     # Create a unique path for the error file download
     path_info = f"activity-error-sheet-{uuid.uuid4()}"
     urlpatterns.append(path(path_info, get_activity_error_sheet, name=path_info))
-    DYNAMIC_URL_PATTERNS.append(path_info)
+    settings.DYNAMIC_URL_PATTERNS.append(path_info)
 
     # Return the path information
     path_info = f"attendance/{path_info}"
@@ -1215,7 +1273,7 @@ def late_come_early_out_delete(request, obj_id):
             json.loads(instances_ids), obj_id
         )
         return redirect(
-            f"/attendance/late-in-early-out-single-view/{next_instance}/?{previous_data}&instances_ids={instances_list}"
+            f"/attendance/late-in-early-out-single-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
         )
 
 
@@ -1228,18 +1286,15 @@ def late_come_early_out_bulk_delete(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    del_ids = []
     for attendance_id in ids:
         try:
             late_come = AttendanceLateComeEarlyOut.objects.get(id=attendance_id)
             late_come.delete()
-            messages.success(
-                request,
-                _("{employee} Late-in early-out deleted.").format(
-                    employee=late_come.employee_id
-                ),
-            )
+            del_ids.append(late_come)
         except (AttendanceLateComeEarlyOut.DoesNotExist, OverflowError, ValueError):
             messages.error(request, _("Attendance not found."))
+    messages.success(request, _("{} Late-in early-out deleted.".format(len(del_ids))))
     return JsonResponse({"message": "Success"})
 
 
@@ -1303,8 +1358,22 @@ def validate_bulk_attendance(request):
     validate_req_count = 0
     success_messages = []
     error_messages = []
+    filtered_ids = []
 
     for obj_id in ids:
+        try:
+            attendance = Attendance.objects.get(id=obj_id)
+            if attendance.employee_id.id != request.user.employee_get.id:
+                filtered_ids.append(obj_id)
+        except Attendance.DoesNotExist:
+            error_messages.append(_("Attendance not found"))
+        except (OverflowError, ValueError):
+            error_messages.append(_("Invalid attendance ID"))
+
+    if request.user.is_superuser:
+        filtered_ids = ids
+
+    for obj_id in filtered_ids:
         try:
             attendance = Attendance.objects.get(id=obj_id)
 
@@ -1362,6 +1431,10 @@ def validate_this_attendance(request, obj_id):
     """
     try:
         attendance = Attendance.objects.get(id=obj_id)
+        if not request.user.is_superuser:
+            if attendance.employee_id.id == request.user.employee_get.id:
+                messages.error(request, _("You cannot validate your own attendance."))
+                return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
         attendance.attendance_validated = True
         attendance.save()
         urlencode = request.GET.urlencode()
@@ -1438,6 +1511,10 @@ def approve_overtime(request, obj_id):
     """
     try:
         attendance = Attendance.objects.get(id=obj_id)
+        if not request.user.is_superuser:
+            if attendance.employee_id.id == request.user.employee_get.id:
+                messages.error(request, _("You cannot approve your own overtime."))
+                return HttpResponseRedirect(request.META.get("HTTP_REFERER", "/"))
         attendance.attendance_overtime_approve = True
         attendance.save()
         urlencode = request.GET.urlencode()
@@ -1476,12 +1553,23 @@ def approve_bulk_overtime(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    otapprove_ids = []
+    filtered_ids = []
     for attendance_id in ids:
+        try:
+            attendance = Attendance.objects.get(id=attendance_id)
+            if attendance.employee_id.employee_user_id != request.user:
+                filtered_ids.append(attendance_id)
+        except (Attendance.DoesNotExist, OverflowError, ValueError):
+            messages.error(request, _("Attendance not found"))
+    if request.user.is_superuser:
+        filtered_ids = ids
+    for attendance_id in filtered_ids:
         try:
             attendance = Attendance.objects.get(id=attendance_id)
             attendance.attendance_overtime_approve = True
             attendance.save()
-            messages.success(request, _("Overtime approved"))
+            otapprove_ids.append(attendance)
             notify.send(
                 request.user.employee_get,
                 recipient=attendance.employee_id.employee_user_id,
@@ -1500,6 +1588,9 @@ def approve_bulk_overtime(request):
             )
         except (Attendance.DoesNotExist, OverflowError, ValueError):
             messages.error(request, _("Attendance not found"))
+    if otapprove_ids:
+        messages.success(request, _(" {} Overtime approved".format(len(otapprove_ids))))
+
     return JsonResponse({"message": "Success"})
 
 
@@ -1547,14 +1638,27 @@ def update_fields_based_shift(request):
 
     employee_ids = (
         request.GET.get("employee_id")
-        if hx_target == "attendanceUpdateForm" or hx_target == "attendanceRequestDiv"
+        if hx_target
+        in [
+            "attendanceUpdate",
+            "attendanceRequest",
+            "attendanceUpdateFormFields",
+            "attendanceFormFields",
+            "attendanceRequestDiv",
+        ]
         else request.GET.getlist("employee_id")
     )
     employee_queryset = (
         (
             Employee.objects.get(id=employee_ids)
-            if hx_target == "attendanceUpdateForm"
-            or hx_target == "attendanceRequestDiv"
+            if hx_target
+            in [
+                "attendanceUpdate",
+                "attendanceUpdateFormFields",
+                "attendanceRequest",
+                "attendanceRequestDiv",
+                "attendanceFormFields",
+            ]
             else Employee.objects.filter(id__in=employee_ids)
         )
         if employee_ids
@@ -1612,13 +1716,48 @@ def update_fields_based_shift(request):
     }
     form = (
         AttendanceUpdateForm(initial=initial_data)
-        if hx_target == "attendanceUpdateForm"
+        if hx_target in ["attendanceUpdate", "attendanceUpdateFormFields"]
         else (
             NewRequestForm(initial=initial_data)
-            if hx_target == "attendanceRequestDiv"
+            if hx_target in ["attendanceRequest", "attendanceRequestDiv"]
             else AttendanceForm(initial=initial_data)
         )
     )
+    return render(
+        request,
+        "attendance/attendance/update_hx_form.html",
+        {"request": request, "form": form},
+    )
+
+
+@login_required
+@hx_request_required
+def update_worked_hour_field(request):
+    """
+    Update the worked hour field based on clock-in and clock-out times.
+
+    This view function calculates the total worked hours for an employee
+    by parsing the clock-in and clock-out dates and times from the request
+    parameters. It computes the duration between the two times and formats
+    the result as a string in the "HH:MM" format. The computed worked hours
+    are then initialized in an AttendanceForm, which is rendered in the
+    specified HTML template.
+    """
+    clock_in = parse_datetime(
+        request.GET.get("attendance_clock_in_date"),
+        request.GET.get("attendance_clock_in"),
+    )
+    clock_out = parse_datetime(
+        request.GET.get("attendance_clock_out_date"),
+        request.GET.get("attendance_clock_out"),
+    )
+
+    total_seconds = (
+        (clock_out - clock_in).total_seconds() if clock_in and clock_out else -1
+    )
+    hours, minutes = divmod(max(total_seconds, 0), 3600)
+    worked_hours_str = f"{int(hours):02}:{int(minutes // 60):02}"
+    form = AttendanceForm(initial={"attendance_worked_hour": worked_hours_str})
     return render(
         request,
         "attendance/attendance/update_hx_form.html",
@@ -1953,6 +2092,7 @@ def create_grace_time(request):
 @permission_required("base.change_employeeshift")
 def assign_shift(request, grace_id):
     gracetime = GraceTime.objects.filter(id=grace_id).first() if grace_id else None
+
     if gracetime:
         form = GraceTimeAssignForm()
         if request.method == "POST":
@@ -2016,19 +2156,32 @@ def delete_grace_time(request, grace_id):
     GET : return grace time form template
     """
     try:
-        GraceTime.objects.get(id=grace_id).delete()
+        delete_error = False
+        default_grace_time_count = GraceTime.objects.filter(is_default=True).count()
+        grace_time_count = GraceTime.objects.filter(is_default=False).count()
+        grace_time = GraceTime.objects.get(id=grace_id)
+        grace_time_type = grace_time.is_default
+        grace_time.delete()
         messages.success(request, _("Grace time deleted successfully."))
     except GraceTime.DoesNotExist:
+        delete_error = True
         messages.error(request, _("Grace Time Does not exists.."))
     except ProtectedError:
+        delete_error = True
         messages.error(request, _("Related datas exists."))
-    context = {
-        "condition": AttendanceValidationCondition.objects.first(),
-        "default_grace_time": GraceTime.objects.filter(is_default=True).first(),
-        "grace_times": GraceTime.objects.all().exclude(is_default=True),
-    }
-
-    return render(request, "attendance/grace_time/grace_time_table.html", context)
+    if delete_error:
+        if grace_time_type:
+            return HttpResponse(
+                "<script>$('#default-containerReload').click();</script>"
+            )
+        return HttpResponse("<script>$('#gracetime-containerReload').click();</script>")
+    elif default_grace_time_count == 1 and grace_time_type:
+        return HttpResponse(
+            "<script>$('#default-containerReload').click();$('.defaultGraceNav').click();</script>"
+        )
+    elif grace_time_count == 1 and not grace_time_type:
+        return HttpResponse("<script>$('#gracetime-containerReload').click();</script>")
+    return HttpResponse("<script>$('#reloadMessagesButton').click();</script>")
 
 
 @login_required
@@ -2286,9 +2439,11 @@ def delete_comment_file(request):
 def work_records(request):
     today = date.today()
     previous_data = request.GET.urlencode()
+    employee_filter_form = EmployeeFilter(request.GET)
     context = {
         "current_date": today,
         "pd": previous_data,
+        "f": employee_filter_form,
     }
     return render(
         request, "attendance/work_record/work_record_view.html", context=context
@@ -2305,36 +2460,79 @@ def work_records_change_month(request):
         request, employee_filter_form.qs, "attendance.view_attendance"
     )
 
+    all_employees = employees
+
+    paginator_emp = Paginator(employees, 20)
+    page_emp = paginator_emp.get_page(request.GET.get("page"))
+
     month_str = request.GET.get("month", f"{date.today().year}-{date.today().month}")
     try:
         year, month = map(int, month_str.split("-"))
     except ValueError:
         year, month = date.today().year, date.today().month
 
-    employees = [request.user.employee_get] + list(employees)
+    employees = [request.user.employee_get] + list(page_emp.object_list)
 
-    month_dates = [
-        datetime(year, month, day).date()
-        for week in calendar.monthcalendar(year, month)
-        for day in week
-        if day
-    ]
+    start_date_str = request.GET.get("start_date")
+    end_date_str = request.GET.get("end_date")
+
+    # Initialize as None
+    start_date = None
+    end_date = None
+
+    # Try parsing the start date
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            start_date = None
+
+    # Try parsing the end date
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            end_date = None
+
+    # Default end_date to today if missing or invalid
+    if not end_date:
+        today = date.today()
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        end_date = date(today.year, today.month, last_day)
+
+    # Default start_date to first day of end_date's month if missing or invalid
+    if not start_date:
+        start_date = date(year=end_date.year, month=end_date.month, day=1)
+
+    # Ensure start_date is not after end_date
+    if start_date > end_date:
+        # Optional: raise error or swap, depending on your use case
+        start_date = date(year=end_date.year, month=end_date.month, day=1)
+
+    # Generate list of dates between start_date and end_date (inclusive)
+    month_dates = []
+    current_date = start_date
+    while current_date <= end_date:
+        month_dates.append(current_date)
+        current_date += timedelta(days=1)
 
     work_records = WorkRecords.objects.filter(
-        date__in=month_dates, employee_id__in=employees
+        date__in=month_dates, employee_id__in=page_emp.object_list
     ).select_related("employee_id", "shift_id", "attendance_id")
 
     work_records_dict = {(wr.employee_id.id, wr.date): wr for wr in work_records}
 
-    data = {
+    work_record_table = {
         employee: [
             work_records_dict.get((employee.id, current_date))
             for current_date in month_dates
         ]
-        for employee in employees
+        for employee in all_employees
     }
 
-    paginator = Paginator(list(data.items()), get_pagination())
+    paginated_table = list(work_record_table.items())
+
+    paginator = Paginator(paginated_table, 20)
     page = paginator.get_page(request.GET.get("page"))
 
     context = {
@@ -2352,16 +2550,61 @@ def work_records_change_month(request):
 @login_required
 @permission_required("attendance.view_workrecords")
 def work_record_export(request):
+
     try:
-        month = int(request.GET.get("month") or date.today().month)
-        year = int(request.GET.get("year") or date.today().year)
+        month_str = request.GET.get("month")
+        if month_str:
+            year, month = map(int, month_str.split("-"))
+        else:
+            today = date.today()
+            year, month = today.year, today.month
     except ValueError:
         return HttpResponseBadRequest("Invalid month or year parameter.")
 
     employees = EmployeeFilter(request.GET).qs
     records = WorkRecords.objects.filter(date__month=month, date__year=year)
-    num_days = calendar.monthrange(year, month)[1]
-    all_date_objects = [date(year, month, day) for day in range(1, num_days + 1)]
+    # all_date_objects = [date(year, month, day) for day in range(1, num_days + 1)]
+
+    start_date_str = request.GET.get("start_date")
+    end_date_str = request.GET.get("end_date")
+
+    # Initialize as None
+    start_date = None
+    end_date = None
+
+    # Try parsing the start date
+    if start_date_str:
+        try:
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            start_date = None
+
+    # Try parsing the end date
+    if end_date_str:
+        try:
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            end_date = None
+
+    # Default end_date to today if missing or invalid
+    if not end_date:
+        end_date = date.today()
+
+    # Default start_date to first day of end_date's month if missing or invalid
+    if not start_date:
+        start_date = date(year=end_date.year, month=end_date.month, day=1)
+
+    # Ensure start_date is not after end_date
+    if start_date > end_date:
+        # Optional: raise error or swap, depending on your use case
+        start_date = date(year=end_date.year, month=end_date.month, day=1)
+
+    # Generate list of dates between start_date and end_date (inclusive)
+    all_date_objects = []
+    current_date = start_date
+    while current_date <= end_date:
+        all_date_objects.append(current_date)
+        current_date += timedelta(days=1)
     leave_dates = set(monthly_leave_days(month, year))
 
     record_lookup = defaultdict(lambda: "ABS")
@@ -2371,7 +2614,7 @@ def work_record_export(request):
             record_lookup[record_key] = record.work_record_type
 
     date_format = request.user.employee_get.get_date_format()
-    format_string = HORILLA_DATE_FORMATS.get(date_format)
+    format_string = settings.HORILLA_DATE_FORMATS.get(date_format)
     formatted_dates = [day.strftime(format_string) for day in all_date_objects]
     data_rows = []
 
@@ -2388,12 +2631,66 @@ def work_record_export(request):
     columns = ["Employee"] + formatted_dates
     df = pd.DataFrame(data_rows, columns=columns)
 
+    company = getattr(request, "selected_company_instance", None)
+    logo_path = getattr(company, "icon", "") if company else ""
+    company_title = getattr(company, "company", "") if company else ""
+    date_range = f"{start_date} TO {end_date}"
+    report_title = str(_("Work Records Status"))
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="Sheet1")
+        df.to_excel(
+            writer, index=False, sheet_name="Sheet1", startrow=6
+        )  # leave space for header
         workbook = writer.book
         worksheet = writer.sheets["Sheet1"]
 
+        # --- Header Formats ---
+        company_format = workbook.add_format(
+            {"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"}
+        )
+        title_format = workbook.add_format(
+            {
+                "bold": True,
+                "font_size": 14,
+                "align": "center",
+                "valign": "vcenter",
+                "font_color": "#FF0000",
+            }
+        )
+        date_format = workbook.add_format(
+            {"italic": True, "font_size": 11, "align": "center", "valign": "vcenter"}
+        )
+
+        # --- Calculate header merge range ---
+        total_columns = len(df.columns)
+        merge_range = xl_range(0, 0, 0, total_columns - 1)
+
+        # --- 1️⃣ Company Name ---
+        worksheet.merge_range(merge_range, company_title or "", company_format)
+
+        # --- 2️⃣ Report Title ---
+        worksheet.merge_range(
+            xl_range(1, 0, 2, total_columns - 1), report_title or "", title_format
+        )
+
+        # --- 3️⃣ Date Range ---
+        worksheet.merge_range(
+            xl_range(3, 0, 3, total_columns - 1), date_range or "", date_format
+        )
+
+        # --- 4️⃣ Company Logo (optional) ---
+        if logo_path:
+            try:
+                worksheet.insert_image(
+                    "A1",
+                    str(os.path.join(settings.MEDIA_ROOT, str(logo_path))),
+                    {"x_scale": 0.5, "y_scale": 0.5},
+                )
+            except Exception as e:
+                print(f"Logo insert failed: {e}")
+
+        # --- Cell formats for codes ---
         formats = {
             "ABS": workbook.add_format(
                 {"bg_color": "#808080", "font_color": "#ffffff"}
@@ -2412,14 +2709,18 @@ def work_record_export(request):
             ),
         }
 
-        for row_idx, row in enumerate(df.itertuples(index=False), start=1):
-            for col_idx, cell_value in enumerate(row[1:], start=1):
+        # --- Apply cell formats ---
+        for row_idx, row in enumerate(
+            df.itertuples(index=False), start=7
+        ):  # data starts from row 7
+            for col_idx, cell_value in enumerate(row):
                 if cell_value in formats:
                     worksheet.write(row_idx, col_idx, cell_value, formats[cell_value])
 
+        # --- Auto column width ---
         for col_idx, col in enumerate(df.columns):
             max_len = max(df[col].astype(str).map(len).max(), len(col))
-            worksheet.set_column(col_idx, col_idx, max_len)
+            worksheet.set_column(col_idx, col_idx, min(max_len + 2, 50))
 
     output.seek(0)
 
@@ -2427,7 +2728,7 @@ def work_record_export(request):
         output.read(),
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    response["Content-Disposition"] = 'attachment; filename="work_record_export.xlsx"'
+    response["Content-Disposition"] = f'attachment; filename="Work Record Status.xlsx"'
     return response
 
 

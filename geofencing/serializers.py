@@ -11,16 +11,14 @@ class GeoFencingSetupSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
         geolocator = Nominatim(user_agent="geo_checker")  # Use a unique user-agent
-        start = data.get("start")
-        if start:
-            try:
-                latitude = data.get("latitude")
-                longitude = data.get("longitude")
-                location = geolocator.reverse((latitude, longitude), exactly_one=True)
-                if not location:
-                    raise serializers.ValidationError("Invalid Location")
-            except Exception as e:
-                raise serializers.ValidationError(e)
+        try:
+            latitude = data.get("latitude")
+            longitude = data.get("longitude")
+            location = geolocator.reverse((latitude, longitude), exactly_one=True)
+            if not location:
+                raise serializers.ValidationError("Invalid Location")
+        except Exception as e:
+            raise serializers.ValidationError(e)
         return data
 
 

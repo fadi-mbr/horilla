@@ -10,7 +10,6 @@ from itertools import chain, groupby
 
 import pandas as pd
 from django.apps import apps
-from django.contrib.auth.models import User
 from django.db import connection, models, transaction
 from django.utils.translation import gettext as _
 
@@ -25,6 +24,7 @@ from base.models import (
     WorkType,
 )
 from employee.models import Employee, EmployeeWorkInformation
+from horilla_auth.models import HorillaUser
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +256,9 @@ def process_employee_records(data_frame):
     phone_regex = re.compile(r"^\+?\d{10,15}$")
     allowed_genders = frozenset(choice[0] for choice in Employee.choice_gender)
     existing_badge_ids = frozenset(Employee.objects.values_list("badge_id", flat=True))
-    existing_usernames = frozenset(User.objects.values_list("username", flat=True))
+    existing_usernames = frozenset(
+        HorillaUser.objects.values_list("username", flat=True)
+    )
     existing_name_emails = frozenset(
         (fname, lname, email)
         for fname, lname, email in Employee.objects.values_list(
@@ -400,18 +402,22 @@ def process_employee_records(data_frame):
 
 def bulk_create_user_import(success_lists):
     """
-    Creates new User instances in bulk from a list of dictionaries containing user data.
+    Creates new HorillaUser instances in bulk from a list of dictionaries containing user data.
 
     Returns:
-        list: A list of created User instances. If no new users are created, returns an empty list.
+        list: A list of created HorillaUser instances. If no new users are created, returns an empty list.
     """
     emails = [row["Email"] for row in success_lists]
     existing_usernames = (
-        set(User.objects.filter(username__in=emails).values_list("username", flat=True))
+        set(
+            HorillaUser.objects.filter(username__in=emails).values_list(
+                "username", flat=True
+            )
+        )
         if is_postgres
         else set(
             chain.from_iterable(
-                User.objects.filter(username__in=chunk).values_list(
+                HorillaUser.objects.filter(username__in=chunk).values_list(
                     "username", flat=True
                 )
                 for chunk in chunked(emails, 999)
@@ -420,7 +426,7 @@ def bulk_create_user_import(success_lists):
     )
 
     users_to_create = [
-        User(
+        HorillaUser(
             username=row["Email"],
             email=row["Email"],
             password=str(row["Phone"]).strip(),
@@ -433,7 +439,7 @@ def bulk_create_user_import(success_lists):
     created_users = []
     if users_to_create:
         with transaction.atomic():
-            created_users = User.objects.bulk_create(
+            created_users = HorillaUser.objects.bulk_create(
                 users_to_create, batch_size=None if is_postgres else 999
             )
     return created_users
@@ -450,10 +456,10 @@ def bulk_create_employee_import(success_lists):
     existing_users = {
         user.username: user
         for user in (
-            User.objects.filter(username__in=emails).only("id", "username")
+            HorillaUser.objects.filter(username__in=emails).only("id", "username")
             if is_postgres
             else chain.from_iterable(
-                User.objects.filter(username__in=chunk).only("id", "username")
+                HorillaUser.objects.filter(username__in=chunk).only("id", "username")
                 for chunk in chunked(emails, 999)
             )
         )
@@ -956,3 +962,13 @@ def bulk_create_work_info_import(success_lists):
             args=(new_work_info_list, update_work_info_list),
         )
         contract_creation_thread.start()
+
+
+def get_model_class(model_path):
+    """
+    method to return the model class from string 'app.models.Model'
+    """
+    module_name, class_name = model_path.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[class_name])
+    model_class: Employee = getattr(module, class_name)
+    return model_class

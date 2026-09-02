@@ -355,7 +355,7 @@ def attendance_request_changes(request, attendance_id):
         if shift_id is None or not len(shift_id):
             form.add_error("shift_id", "This field is required")
         if form.is_valid():
-            # commit already set to False
+            # commit already set to False in the form save method
             # so the changes not affected to the db
             instance = form.save()
             instance.employee_id = attendance.employee_id
@@ -436,11 +436,11 @@ def validate_attendance_request(request, attendance_id):
         first_dict = empty_data
     else:
         other_dict = json.loads(attendance.requested_data)
-    requests_ids_json = request.GET.get("requests_ids")
+    requests_ids_json = request.session.get("ordered_ids_attendance", [])
     previous_instance_id = next_instance_id = attendance.pk
     if requests_ids_json:
         previous_instance_id, next_instance_id = closest_numbers(
-            json.loads(requests_ids_json), attendance_id
+            requests_ids_json, attendance_id
         )
     return render(
         request,
@@ -469,6 +469,7 @@ def approve_validate_attendance_request(request, attendance_id):
     attendance.is_validate_request_approved = True
     attendance.is_validate_request = False
     attendance.request_description = None
+    attendance.approved_by = request.user.employee_get
     attendance.save()
     if attendance.requested_data is not None:
         requested_data = json.loads(attendance.requested_data)
@@ -486,7 +487,10 @@ def approve_validate_attendance_request(request, attendance_id):
         # DUE TO AFFECT THE OVERTIME CALCULATION ON SAVE METHOD, SAVE THE INSTANCE ONCE MORE
         attendance = Attendance.objects.get(id=attendance_id)
         attendance.save()
-
+    if attendance.request_type == "create_request":
+        attendance.request_type = "created_request"
+        attendance.requested_data = None
+        attendance.save()
     if (
         attendance.attendance_clock_out is None
         or attendance.attendance_clock_out_date is None
@@ -530,7 +534,6 @@ def approve_validate_attendance_request(request, attendance_id):
         early_out(
             attendance, start_time=start_time_sec, end_time=end_time_sec, shift=shift
         )
-
     messages.success(request, _("Attendance request has been approved"))
     employee = attendance.employee_id
     notify.send(
@@ -657,7 +660,14 @@ def bulk_approve_attendance_request(request):
     """
     ids = request.POST["ids"]
     ids = json.loads(ids)
+    filtered_ids = []
     for attendance_id in ids:
+        attendance = Attendance.objects.get(id=attendance_id)
+        if attendance.employee_id != request.user.employee_get:
+            filtered_ids.append(attendance_id)
+    if request.user.is_superuser:
+        filtered_ids = ids
+    for attendance_id in filtered_ids:
         attendance = Attendance.objects.get(id=attendance_id)
         prev_attendance_date = attendance.attendance_date
         prev_attendance_clock_in_date = attendance.attendance_clock_in_date
@@ -666,6 +676,7 @@ def bulk_approve_attendance_request(request):
         attendance.is_validate_request_approved = True
         attendance.is_validate_request = False
         attendance.request_description = None
+        attendance.approved_by = request.user.employee_get
         attendance.save()
         if attendance.requested_data is not None:
             requested_data = json.loads(attendance.requested_data)

@@ -10,17 +10,19 @@ from datetime import timedelta
 from urllib.parse import parse_qs
 
 from django.contrib import messages
-from django.contrib.auth.models import User
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
 from base.methods import (
+    closest_numbers,
     eval_validate,
     filtersubordinates,
     get_key_instances,
     paginator_qry,
 )
+from base.views import paginator_qry
 from employee.filters import DisciplinaryActionFilter, PolicyFilter
 from employee.forms import DisciplinaryActionForm, PolicyForm
 from employee.models import (
@@ -31,6 +33,7 @@ from employee.models import (
     PolicyMultipleFile,
 )
 from horilla.decorators import hx_request_required, login_required, permission_required
+from horilla_auth.models import HorillaUser
 from notifications.signals import notify
 
 
@@ -65,7 +68,7 @@ def create_policy(request):
         form = PolicyForm(request.POST, request.FILES, instance=instance)
         if form.is_valid():
             form.save()
-            messages.success(request, _("Policy saved"))
+            messages.success(request, "Policy saved")
             form = PolicyForm()
             # return HttpResponse("<script>window.location.reload()</script>")
     return render(request, "policies/form.html", {"form": form})
@@ -119,7 +122,7 @@ def delete_policies(request):
         if count == 0:
             messages.error(request, _("Policies Not Found"))
         else:
-            messages.success(request, _("Policies deleted"))
+            messages.success(request, "Policies deleted")
     except ValueError:
         messages.error(request, _("Policies Not Found"))
     return redirect(view_policies)
@@ -141,7 +144,7 @@ def add_attachment(request):
         attachments.append(attachment)
     policy = Policy.objects.get(id=policy_id)
     policy.attachments.add(*attachments)
-    messages.success(request, _("Attachments added"))
+    messages.success(request, "Attachments added")
     return render(request, "policies/attachments.html", {"policy": policy})
 
 
@@ -238,7 +241,7 @@ def employee_account_block_unblock(emp_id, result):
     employee = get_object_or_404(Employee, id=emp_id)
     if not employee:
         return redirect(disciplinary_actions)
-    user = get_object_or_404(User, id=employee.employee_user_id.id)
+    user = get_object_or_404(HorillaUser, id=employee.employee_user_id.id)
     if not user:
         return redirect(disciplinary_actions)
     user.is_active = result
@@ -341,7 +344,7 @@ def remove_employee_disciplinary_action(request, action_id, emp_id):
 
     if action_type == "dismissal" or action_type == "suspension":
         emp = get_object_or_404(Employee, id=emp_id)
-        user = get_object_or_404(User, id=emp.employee_user_id.id)
+        user = get_object_or_404(HorillaUser, id=emp.employee_user_id.id)
         if user.is_active:
             pass
         else:
@@ -361,7 +364,7 @@ def remove_employee_disciplinary_action(request, action_id, emp_id):
     messages.success(
         request, _("Employee removed from disciplinary action successfully.")
     )
-    return redirect(f"/employee/disciplinary-filter-view?click_id={dis_action.id}")
+    return redirect(f"/employee/disciplinary-actions-list?click_id={dis_action.id}")
 
 
 @login_required
@@ -371,6 +374,9 @@ def delete_actions(request, action_id):
     """
     This method is used to delete Disciplinary action
     """
+    request_copy = request.GET.copy()
+    request_copy.pop("instances_ids", None)
+    previous_data = request_copy.urlencode()
 
     dis = DisciplinaryAction.objects.get(id=action_id)
 
@@ -380,7 +386,7 @@ def delete_actions(request, action_id):
 
         if action_type == "dismissal" or action_type == "suspension":
             employee = get_object_or_404(Employee, id=dis_emp.id)
-            user = get_object_or_404(User, id=employee.employee_user_id.id)
+            user = get_object_or_404(HorillaUser, id=employee.employee_user_id.id)
             if user.is_active:
                 pass
             else:
@@ -394,8 +400,21 @@ def delete_actions(request, action_id):
     messages.success(request, _("Disciplinary action deleted."))
     dis_actions = DisciplinaryAction.objects.all()
 
+    hx_target = request.META.get("HTTP_HX_TARGET")
+    if hx_target and hx_target == "genericModalBody":
+        instances_ids = request.GET.get("instances_ids")
+        instances_list = json.loads(instances_ids)
+        if action_id in instances_list:
+            instances_list.remove(action_id)
+            previous_instance, next_instance = closest_numbers(
+                json.loads(instances_ids), action_id
+            )
+        return redirect(
+            f"/employee/disciplinary-actions-detail-view/{next_instance}/?{previous_data}&instance_ids={instances_list}&deleted=true"
+        )
+
     if dis_actions.exists():
-        return redirect(disciplinary_filter_view)
+        return redirect(reverse("disciplinary-actions-list"))
     return HttpResponse("<script>window.location.reload()</script>")
 
 

@@ -3999,28 +3999,28 @@
 });
 staticUrl = $("#statiUrl").attr("data-url");
 
-function initSelect2(context) {
-    $(context).find(".oh-select").each(function () {
-        if ($(this).data("select2")) {
-            $(this).select2("destroy");  // only destroy if initialized
-        }
-        $(this).select2({ width: "100%" });
-    });
-
-    $(context).find("select").off("select2:select").on("select2:select", function () {
-        this.dispatchEvent(new Event("change"));
-    });
-}
-
-
 $(document).ready(function () {
-    // initSelect2(document); # 914 , Loading two select fields
+    $(".oh-select").each(function () {
+        if ($(this).hasClass("select2-hidden-accessible")) {
+            $(this).select2("destroy");
+        }
+        $(this).select2({ width: '100%' });
+    });
+
+    $("select").on("select2:select", function (e) {
+        $(this)[0].dispatchEvent(new Event("change"));
+    });
 });
+
 
 $(document).on("htmx:afterSettle", function (event) {
-    initSelect2(event.target);
-});
+    var target = $(event.target);
+    target.find(".oh-select").select2({ width: '100%' });
 
+    target.find("select").off("select2:select").on("select2:select", function (e) {
+        this.dispatchEvent(new Event("change"));
+    });
+});
 
 
 // Helper function to hash data using SHA-256

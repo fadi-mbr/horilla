@@ -1,6 +1,4 @@
-from django import forms
 from django.template.loader import render_to_string
-from django.utils.translation import gettext_lazy as _
 
 from base.forms import ModelForm
 
@@ -8,12 +6,11 @@ from .models import GeoFencing
 
 
 class GeoFencingSetupForm(ModelForm):
-    verbose_name = _("Geofence Configuration")
+    verbose_name = "Geofence Configuration"
 
     class Meta:
         model = GeoFencing
-        fields = "__all__"
-        widgets = {"company_id": forms.HiddenInput()}
+        exclude = ["company_id"]
 
     def as_p(self):
         """
