@@ -307,6 +307,35 @@ def clock_in(request):
         return HttpResponse("<script>location.reload();</script>")
 
 
+def _open_activity_for_punch(attendance_activities, date_today):
+    """
+    Pick the open activity a check-out punch on `date_today` belongs to.
+
+    Upstream closes the employee's oldest open activity regardless of date. One
+    missed check-out therefore offsets every later punch by a day, permanently,
+    and never self-heals. Scope the match instead:
+
+      1. an activity opened on the punch's own day, else
+      2. an activity opened the previous day, for a night shift crossing
+         midnight, else
+      3. nothing — leave the stale activity open rather than closing the wrong
+         one, so the gap stays visible and repairable.
+
+    args:
+        attendance_activities : the employee's activities queryset
+        date_today            : the date the check-out punch happened on
+    """
+    open_activities = attendance_activities.filter(clock_out__isnull=True)
+
+    same_day = open_activities.filter(attendance_date=date_today).last()
+    if same_day is not None:
+        return same_day
+
+    return open_activities.filter(
+        attendance_date=date_today - timedelta(days=1)
+    ).last()
+
+
 def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=None):
     """
     Clock out the attendance and activity
@@ -319,12 +348,10 @@ def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=No
     attendance_activities = AttendanceActivity.objects.filter(
         employee_id=employee,
     ).order_by("attendance_date", "id")
-    attendance_activity = None  # Initialize attendance_activity
 
-    if attendance_activities.filter(clock_out__isnull=True).exists():
-        attendance_activity = attendance_activities.filter(
-            clock_out__isnull=True
-        ).last()
+    attendance_activity = _open_activity_for_punch(attendance_activities, date_today)
+
+    if attendance_activity is not None:
         attendance_activity.clock_out = out_datetime
         attendance_activity.clock_out_date = date_today
         attendance_activity.out_datetime = out_datetime
@@ -344,10 +371,27 @@ def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=No
             total_seconds = days_second + seconds
             duration = duration + total_seconds
         duration = format_time(duration)
-        # update clock out of attendance
-        attendance = Attendance.objects.filter(employee_id=employee).order_by(
-            "-attendance_date", "-id"
-        )[0]
+        # Update the attendance row this activity actually belongs to. Selecting
+        # the employee's newest row instead (the upstream behaviour) stamps the
+        # punch onto the wrong day as soon as one clock-out is ever missed, and
+        # the day it should have closed then stays null forever.
+        attendance = (
+            Attendance.objects.filter(
+                employee_id=employee,
+                attendance_date=attendance_activity.attendance_date,
+            )
+            .order_by("-id")
+            .first()
+        )
+        if attendance is None:
+            logger.error(
+                "No attendance row for employee %s on %s; activity %s closed but "
+                "the day row could not be updated.",
+                employee,
+                attendance_activity.attendance_date,
+                attendance_activity.pk,
+            )
+            return
         attendance.attendance_clock_out = now + ":00"
         attendance.attendance_clock_out_date = date_today
         attendance.attendance_worked_hour = duration
@@ -360,7 +404,12 @@ def clock_out_attendance_and_activity(employee, date_today, now, out_datetime=No
 
         return attendance
 
-    logger.error("No attendance clock in activity found that needs clocking out.")
+    logger.error(
+        "No open attendance activity for %s on %s (or the preceding night shift) "
+        "that needs clocking out.",
+        employee,
+        date_today,
+    )
     return
 
 

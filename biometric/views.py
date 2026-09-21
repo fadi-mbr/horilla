@@ -6,9 +6,12 @@ as well as scheduling attendance capture. Also provides views for managing emplo
 registered on biometric devices.
 """
 
+import fcntl
 import json
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from threading import Event, Thread
 from urllib.parse import parse_qs, unquote
 
@@ -56,6 +59,10 @@ from .forms import (
 from .models import BiometricDevices, BiometricEmployees, COSECAttendanceArguments
 
 logger = logging.getLogger(__name__)
+
+# How long a failing Anviz punch may hold the fetch window open before the
+# importer gives up on it and moves on (see anviz_biometric_attendance_logs).
+ANVIZ_MAX_REPLAY_HOURS = 24
 
 
 def str_time_seconds(time):
@@ -2267,12 +2274,50 @@ def zk_biometric_attendance_scheduler(device_id):
         zk_biometric_attendance_logs(device)
 
 
+@contextmanager
+def anviz_import_mutex(device):
+    """Serialise Anviz imports for one device across every caller.
+
+    The scheduler, the management command and the UI's fetch button all reach
+    the same importer. Its idempotency guard is a check-then-act with no
+    database constraint behind it, so two overlapping fetches both decide a
+    punch is new and both import it — and a replayed clock-in nulls that day's
+    clock-out. One writer at a time is what actually makes the guard hold.
+    """
+    lock_path = f"/tmp/horilla-anviz-import-{device.id}.lock"
+    handle = open(lock_path, "w")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.info(
+                "Anviz import for %s already running elsewhere; skipping this run.",
+                device.id,
+            )
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def anviz_biometric_attendance_logs(device):
     """
     Retrieves attendance records from an Anviz biometric device and processes them.
 
     :param device_id: The Object Id of the Anviz biometric device.
     """
+    with anviz_import_mutex(device) as acquired:
+        if not acquired:
+            return 0
+        return _anviz_biometric_attendance_logs(device)
+
+
+def _anviz_biometric_attendance_logs(device):
+    """Fetch and import one device's punches. Call only under the import mutex."""
     current_utc_time = datetime.utcnow()
     anviz_device = CrossChexCloudAPI(
         api_url=device.api_url,
@@ -2288,11 +2333,11 @@ def anviz_biometric_attendance_logs(device):
     attendance_records = anviz_device.get_attendance_records(
         begin_time=begin_time, token=device.api_token
     )
-    device.last_fetch_date, device.last_fetch_time = (
-        current_utc_time.date(),
-        current_utc_time.time(),
-    )
-    device.save()
+    # The fetch window is advanced only after the batch is processed, and only
+    # as far as the first punch that failed to apply (see below). Advancing it
+    # up-front — the upstream behaviour — puts any punch that raises outside
+    # every future window, so a single failure loses that punch permanently.
+    failed_punch_utc = None
     for attendance in attendance_records["list"]:
         badge_id = attendance["employee"]["workno"]
         punch_code = attendance["checktype"]
@@ -2327,17 +2372,46 @@ def anviz_biometric_attendance_logs(device):
                 time=date_time_obj.time(),
                 datetime=date_time_obj,
             )
+            punch_utc = date_time_utc.astimezone(dt_timezone.utc).replace(tzinfo=None)
             if punch_code in {0, 128}:
                 try:
                     clock_in(request_data)
-                except Exception as error:
-                    logger.error("Error in clock in ", error)
+                except Exception:
+                    logger.exception(
+                        "Error clocking in badge %s at %s", badge_id, date_time_obj
+                    )
+                    if failed_punch_utc is None or punch_utc < failed_punch_utc:
+                        failed_punch_utc = punch_utc
             else:
                 try:
                     # // 1 , 129 check type check out and door close
                     clock_out(request_data)
-                except Exception as error:
-                    logger.error("Error in clock out ", error)
+                except Exception:
+                    logger.exception(
+                        "Error clocking out badge %s at %s", badge_id, date_time_obj
+                    )
+                    if failed_punch_utc is None or punch_utc < failed_punch_utc:
+                        failed_punch_utc = punch_utc
+
+    # Re-deliver failed punches on the next run; the idempotency guard above
+    # makes the replay safe. Never hold the window open more than MAX_REPLAY
+    # hours, so one permanently-failing punch cannot pin the fetch forever.
+    next_fetch_utc = current_utc_time
+    if failed_punch_utc is not None:
+        replay_floor = current_utc_time - timedelta(hours=ANVIZ_MAX_REPLAY_HOURS)
+        next_fetch_utc = max(failed_punch_utc, replay_floor)
+        if failed_punch_utc < replay_floor:
+            logger.error(
+                "Anviz punch at %s UTC has failed for more than %sh; advancing the "
+                "fetch window past it. That punch needs a manual repair.",
+                failed_punch_utc,
+                ANVIZ_MAX_REPLAY_HOURS,
+            )
+    device.last_fetch_date, device.last_fetch_time = (
+        next_fetch_utc.date(),
+        next_fetch_utc.time(),
+    )
+    device.save()
     return len(attendance_records["list"])
 
 
@@ -2598,13 +2672,16 @@ try:
         if device:
             if str_time_seconds(device.scheduler_duration) > 0:
                 if device.machine_type == "anviz":
-                    scheduler = BackgroundScheduler()
-                    scheduler.add_job(
-                        lambda: anviz_biometric_attendance_scheduler(device.id),
-                        "interval",
-                        seconds=str_time_seconds(device.scheduler_duration),
-                    )
-                    scheduler.start()
+                    # Anviz scheduling is owned by BiometricConfig.ready()
+                    # (biometric/apps.py), which starts exactly one scheduler
+                    # per container under a flock. This module-level block runs
+                    # on *every* import, so in a multi-worker gunicorn it used
+                    # to start one unsynchronised scheduler per worker. Two
+                    # concurrent fetches deliver the same punch twice, the
+                    # importer's check-then-act guard loses the race, and the
+                    # replayed clock-in nulls that day's clock-out. Leave it to
+                    # apps.py.
+                    pass
                 elif device.machine_type == "zk":
                     scheduler = BackgroundScheduler()
                     scheduler.add_job(
