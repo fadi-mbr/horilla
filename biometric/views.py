@@ -64,7 +64,15 @@ logger = logging.getLogger(__name__)
 
 # How long a failing Anviz punch may hold the fetch window open before the
 # importer gives up on it and moves on (see anviz_biometric_attendance_logs).
-ANVIZ_MAX_REPLAY_HOURS = 24
+#
+# Deliberately short. A punch that fails once almost always fails forever — the
+# common case is an OUT with no matching IN, because the IN was dropped while
+# that employee had no shift. Holding the window for a day behind such a punch
+# stalls the freshness marker for everyone and makes the importer re-fetch an
+# ever-growing range. A whole-batch failure (an API or auth error) raises before
+# the window is saved at all, so transient faults are already covered without
+# this; an hour just buys a few retries for the rare genuine blip.
+ANVIZ_MAX_REPLAY_HOURS = 1
 
 # CrossChex badges that must never map to a Horilla employee.
 #   "1"   - "Admin MBR / CTO" on the device. Zero-pad matching would map it
@@ -2435,6 +2443,7 @@ def _anviz_biometric_attendance_logs(device):
     # up-front — the upstream behaviour — puts any punch that raises outside
     # every future window, so a single failure loses that punch permanently.
     failed_punch_utc = None
+    unapplied = []
     for attendance in attendance_records["list"]:
         badge_id = attendance["employee"]["workno"]
         punch_code = attendance["checktype"]
@@ -2475,22 +2484,36 @@ def _anviz_biometric_attendance_logs(device):
             # failure. Treating it as one pinned the fetch window permanently,
             # because essentially every punch raises that cosmetic error.
             if not punch_recorded(employee, date_time_obj, punch_code):
+                unapplied.append(
+                    f"badge {badge_id} "
+                    f"{'IN' if punch_code in {0, 128} else 'OUT'} "
+                    f"{date_time_obj:%Y-%m-%d %H:%M}"
+                )
                 if failed_punch_utc is None or punch_utc < failed_punch_utc:
                     failed_punch_utc = punch_utc
 
-    # Re-deliver failed punches on the next run; the idempotency guard above
-    # makes the replay safe. Never hold the window open more than MAX_REPLAY
-    # hours, so one permanently-failing punch cannot pin the fetch forever.
+    # Re-deliver recently failed punches on the next run; the idempotency guard
+    # makes the replay safe. Never hold the window more than MAX_REPLAY hours,
+    # so a punch that can never apply cannot pin ingestion for everyone.
     next_fetch_utc = current_utc_time
     if failed_punch_utc is not None:
         replay_floor = current_utc_time - timedelta(hours=ANVIZ_MAX_REPLAY_HOURS)
         next_fetch_utc = max(failed_punch_utc, replay_floor)
         if failed_punch_utc < replay_floor:
             logger.error(
-                "Anviz punch at %s UTC has failed for more than %sh; advancing the "
-                "fetch window past it. That punch needs a manual repair.",
+                "Anviz punch at %s UTC still has not applied after %sh; advancing "
+                "the fetch window past it. %s punch(es) in this batch did not "
+                "apply and need a manual repair: %s",
                 failed_punch_utc,
                 ANVIZ_MAX_REPLAY_HOURS,
+                len(unapplied),
+                "; ".join(unapplied[:20]),
+            )
+        else:
+            logger.warning(
+                "%s Anviz punch(es) did not apply and will be retried: %s",
+                len(unapplied),
+                "; ".join(unapplied[:20]),
             )
     device.last_fetch_date, device.last_fetch_time = (
         next_fetch_utc.date(),
