@@ -7,6 +7,7 @@ registered on biometric devices.
 """
 
 import fcntl
+import hashlib
 import json
 import logging
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from django.contrib import messages
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.template.loader import render_to_string
+from django.db import connection
 from django.utils import timezone as django_timezone
 from django.utils.translation import gettext as __
 from django.utils.translation import gettext_lazy as _
@@ -2320,16 +2322,65 @@ def employee_for_badge(badge_id):
     return None
 
 
+def punch_recorded(employee, punched_at, punch_code):
+    """Has this exact punch already been stored for this employee?
+
+    Used both to skip a re-delivered punch and to confirm that an applied one
+    actually landed.
+    """
+    if punch_code in {0, 128}:
+        return AttendanceActivity.objects.filter(
+            employee_id=employee,
+            clock_in_date=punched_at.date(),
+            clock_in=punched_at.time(),
+        ).exists()
+    return AttendanceActivity.objects.filter(
+        employee_id=employee,
+        clock_out_date=punched_at.date(),
+        clock_out=punched_at.time(),
+    ).exists()
+
+
+def _advisory_lock_key(device_id):
+    """Stable 63-bit key for this device's Postgres advisory lock."""
+    digest = hashlib.blake2b(str(device_id).encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
+
+
 @contextmanager
 def anviz_import_mutex(device):
-    """Serialise Anviz imports for one device across every caller.
+    """Serialise Anviz imports for one device across every process.
 
-    The scheduler, the management command and the UI's fetch button all reach
-    the same importer. Its idempotency guard is a check-then-act with no
-    database constraint behind it, so two overlapping fetches both decide a
-    punch is new and both import it — and a replayed clock-in nulls that day's
-    clock-out. One writer at a time is what actually makes the guard hold.
+    The scheduler, the management commands and the UI's fetch button all reach
+    the same importer, and CrossChex rate-limits its attendance interface to one
+    request every 15 seconds per account. Two importers at once therefore do not
+    merely duplicate work — they starve each other, and the scheduler exhausts
+    its retry budget and stalls. That happened on 2026-09-21: a maintenance run
+    in a one-off container held the API busy and live ingestion sat stale.
+
+    The lock is a Postgres advisory lock, not a file lock: a lock file in /tmp
+    is container-local and a one-off `docker run` has its own filesystem, which
+    is exactly the case that broke. Everything reaching this database now
+    contends for the same lock. A non-Postgres backend (tests) falls back to a
+    local flock.
     """
+    if connection.vendor == "postgresql":
+        key = _advisory_lock_key(device.id)
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", [key])
+            if not bool(cursor.fetchone()[0]):
+                logger.info(
+                    "Anviz import for %s is already running elsewhere; skipping.",
+                    device.id,
+                )
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", [key])
+        return
+
     lock_path = f"/tmp/horilla-anviz-import-{device.id}.lock"
     handle = open(lock_path, "w")
     try:
@@ -2398,19 +2449,7 @@ def _anviz_biometric_attendance_logs(device):
             # multi-page fetch can outlive the 5-min schedule). Re-importing a
             # punch duplicates activities and — worse — a replayed IN nulls
             # attendance_clock_out on the day row. Skip punches already stored.
-            if punch_code in {0, 128}:
-                already_imported = AttendanceActivity.objects.filter(
-                    employee_id=employee,
-                    clock_in_date=date_time_obj.date(),
-                    clock_in=date_time_obj.time(),
-                ).exists()
-            else:
-                already_imported = AttendanceActivity.objects.filter(
-                    employee_id=employee,
-                    clock_out_date=date_time_obj.date(),
-                    clock_out=date_time_obj.time(),
-                ).exists()
-            if already_imported:
+            if punch_recorded(employee, date_time_obj, punch_code):
                 continue
             request_data = Request(
                 user=employee.employee_user_id,
@@ -2419,25 +2458,25 @@ def _anviz_biometric_attendance_logs(device):
                 datetime=date_time_obj,
             )
             punch_utc = date_time_utc.astimezone(dt_timezone.utc).replace(tzinfo=None)
-            if punch_code in {0, 128}:
-                try:
+            try:
+                if punch_code in {0, 128}:
                     clock_in(request_data)
-                except Exception:
-                    logger.exception(
-                        "Error clocking in badge %s at %s", badge_id, date_time_obj
-                    )
-                    if failed_punch_utc is None or punch_utc < failed_punch_utc:
-                        failed_punch_utc = punch_utc
-            else:
-                try:
+                else:
                     # // 1 , 129 check type check out and door close
                     clock_out(request_data)
-                except Exception:
-                    logger.exception(
-                        "Error clocking out badge %s at %s", badge_id, date_time_obj
-                    )
-                    if failed_punch_utc is None or punch_utc < failed_punch_utc:
-                        failed_punch_utc = punch_utc
+            except Exception:
+                logger.exception(
+                    "Error applying punch for badge %s at %s", badge_id, date_time_obj
+                )
+
+            # Verify the write instead of trusting the absence of an exception.
+            # clock_in and clock_out render a template against a fake request
+            # object and raise AFTER writing, so an exception is not evidence of
+            # failure. Treating it as one pinned the fetch window permanently,
+            # because essentially every punch raises that cosmetic error.
+            if not punch_recorded(employee, date_time_obj, punch_code):
+                if failed_punch_utc is None or punch_utc < failed_punch_utc:
+                    failed_punch_utc = punch_utc
 
     # Re-deliver failed punches on the next run; the idempotency guard above
     # makes the replay safe. Never hold the window open more than MAX_REPLAY

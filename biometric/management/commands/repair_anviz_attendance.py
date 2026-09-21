@@ -11,8 +11,15 @@ command re-reads punches straight from CrossChex for a date window, rebuilds
 what each employee-day should look like, and reports (or, with --apply,
 writes) the difference.
 
-Read-only by default. It never advances the device's fetch window, so it is
-safe to run alongside the live scheduler. Take a database dump before --apply.
+Read-only by default, and it never advances the device's fetch window.
+
+It does NOT run concurrently with the live scheduler: CrossChex rate-limits its
+attendance interface to one request every 15 seconds per account, so two
+importers starve each other. On 2026-09-21 a run of this command held the API
+busy and live ingestion stalled for nearly two hours. The command now takes the
+same per-device import lock the scheduler uses and waits its turn.
+
+Take a database dump before --apply.
 
     python manage.py repair_anviz_attendance --since 2026-08-24
     python manage.py repair_anviz_attendance --since 2026-08-24 --apply
@@ -32,7 +39,7 @@ from attendance.views.views import attendance_validate
 from base.models import EmployeeShiftDay, EmployeeShiftSchedule
 from biometric.anviz import CrossChexCloudAPI
 from biometric.models import BiometricDevices
-from biometric.views import employee_for_badge
+from biometric.views import anviz_import_mutex, employee_for_badge
 
 logger = logging.getLogger(__name__)
 
@@ -333,58 +340,65 @@ class Command(BaseCommand):
 
         findings, repaired, checked = [], 0, 0
         for device in devices:
-            punches = self._punches(device, since, until)
-            for badge, days in sorted(punches.items()):
-                if only_badges is not None and badge not in only_badges:
-                    continue
-                employee = employee_for_badge(badge)
-                if employee is None:
-                    findings.append(f"  UNKNOWN BADGE  {badge} ({len(days)} days skipped)")
-                    continue
-                for day in sorted(days):
-                    if not since <= day <= until:
+            with anviz_import_mutex(device) as acquired:
+                if not acquired:
+                    raise CommandError(
+                        "The live Anviz importer is running for this device. "
+                        "CrossChex allows one request every 15 seconds, so "
+                        "running both starves the scheduler. Try again shortly."
+                    )
+                punches = self._punches(device, since, until)
+                for badge, days in sorted(punches.items()):
+                    if only_badges is not None and badge not in only_badges:
                         continue
-                    checked += 1
-                    pairs, anomalies = self._pairs(days[day])
-                    activities, row = self._observed(employee, day)
-                    problems = self._diverges(pairs, activities, row)
-
-                    for note in anomalies:
-                        findings.append(f"  DEVICE ODD  {badge} {day}: {note}")
-
-                    if not problems:
+                    employee = employee_for_badge(badge)
+                    if employee is None:
+                        findings.append(f"  UNKNOWN BADGE  {badge} ({len(days)} days skipped)")
                         continue
-                    if row is None:
-                        if not create_missing:
-                            findings.append(
-                                f"  NO DAY ROW  {badge} {day}: needs a clock-in "
-                                f"replay, not repaired"
-                            )
+                    for day in sorted(days):
+                        if not since <= day <= until:
                             continue
-                        if apply:
-                            with transaction.atomic():
-                                created = self._create_day(employee, day, pairs)
-                            if created is None:
+                        checked += 1
+                        pairs, anomalies = self._pairs(days[day])
+                        activities, row = self._observed(employee, day)
+                        problems = self._diverges(pairs, activities, row)
+
+                        for note in anomalies:
+                            findings.append(f"  DEVICE ODD  {badge} {day}: {note}")
+
+                        if not problems:
+                            continue
+                        if row is None:
+                            if not create_missing:
                                 findings.append(
-                                    f"  SKIP   {badge} {day}: no shift or schedule"
+                                    f"  NO DAY ROW  {badge} {day}: needs a clock-in "
+                                    f"replay, not repaired"
                                 )
                                 continue
+                            if apply:
+                                with transaction.atomic():
+                                    created = self._create_day(employee, day, pairs)
+                                if created is None:
+                                    findings.append(
+                                        f"  SKIP   {badge} {day}: no shift or schedule"
+                                    )
+                                    continue
+                                repaired += 1
+                            findings.append(
+                                f"  {'CREATE' if apply else 'WOULD CREATE'} {badge} {day}: "
+                                f"in={_hm(pairs[0][0]) if pairs else '--:--'} "
+                                f"out={_hm(pairs[-1][1]) if pairs else '--:--'}"
+                            )
+                            continue
+
+                        if apply:
+                            with transaction.atomic():
+                                self._rebuild(employee, day, pairs, activities, row)
                             repaired += 1
                         findings.append(
-                            f"  {'CREATE' if apply else 'WOULD CREATE'} {badge} {day}: "
-                            f"in={_hm(pairs[0][0]) if pairs else '--:--'} "
-                            f"out={_hm(pairs[-1][1]) if pairs else '--:--'}"
+                            f"  {'FIXED' if apply else 'DIFF '}  {badge} {day}: "
+                            + "; ".join(problems)
                         )
-                        continue
-
-                    if apply:
-                        with transaction.atomic():
-                            self._rebuild(employee, day, pairs, activities, row)
-                        repaired += 1
-                    findings.append(
-                        f"  {'FIXED' if apply else 'DIFF '}  {badge} {day}: "
-                        + "; ".join(problems)
-                    )
 
         self.stdout.write("")
         for line in findings:
