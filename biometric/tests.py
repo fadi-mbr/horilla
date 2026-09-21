@@ -10,7 +10,7 @@ clock-in nulled that day's clock-out in `clock_in_attendance_and_activity`.
 
 import multiprocessing
 import re
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -221,8 +221,9 @@ class FetchWindowAdvanceTests(TestCase):
             "at the punch re-fetches an ever-growing window forever",
         )
 
-    def test_window_is_held_back_when_the_punch_did_not_land(self):
-        punched = datetime(2026, 9, 21, 9, 0, 0)
+    def test_recent_failed_punch_is_held_for_retry(self):
+        """A punch that just failed is left inside the next fetch window."""
+        punched = datetime.utcnow().replace(microsecond=0) - timedelta(minutes=10)
 
         with patch.object(
             CrossChexCloudAPI, "get_attendance_records",
@@ -235,5 +236,35 @@ class FetchWindowAdvanceTests(TestCase):
             self.device.last_fetch_date, self.device.last_fetch_time
         )
         self.assertLessEqual(
-            stored, punched, "a genuinely failed punch must be re-fetched"
+            stored, punched, "a just-failed punch must be re-fetched"
+        )
+
+    def test_old_failed_punch_does_not_pin_the_window(self):
+        """The stall of 2026-09-21: an unappliable punch blocked everyone.
+
+        An OUT with no matching IN can never apply, so holding the window
+        behind it stalls the freshness marker indefinitely and makes the
+        importer re-fetch an ever-growing range.
+        """
+        punched = datetime.utcnow().replace(microsecond=0) - timedelta(hours=6)
+
+        with patch.object(
+            CrossChexCloudAPI, "get_attendance_records",
+            return_value=self._records(punched),
+        ), patch("biometric.views.clock_in", side_effect=RuntimeError("boom")):
+            anviz_biometric_attendance_logs(self.device)
+
+        self.device.refresh_from_db()
+        stored = datetime.combine(
+            self.device.last_fetch_date, self.device.last_fetch_time
+        )
+        self.assertGreater(
+            stored,
+            punched,
+            "a punch that cannot apply must not pin the window forever",
+        )
+        self.assertLessEqual(
+            stored,
+            datetime.utcnow(),
+            "the window must never move into the future",
         )
