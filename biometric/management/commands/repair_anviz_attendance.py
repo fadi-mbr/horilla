@@ -39,6 +39,7 @@ from attendance.views.views import attendance_validate
 from base.models import EmployeeShiftDay, EmployeeShiftSchedule
 from biometric.anviz import CrossChexCloudAPI
 from biometric.models import BiometricDevices
+from employee.models import Employee
 from biometric.views import anviz_import_mutex, employee_for_badge
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,15 @@ class Command(BaseCommand):
         parser.add_argument(
             "--badges",
             help="Restrict to these comma-separated badge ids (as CrossChex sends them).",
+        )
+        parser.add_argument(
+            "--include-inactive",
+            action="store_true",
+            help="Also reconcile employees marked inactive. The importer skips "
+                 "them so a leaver accrues no new attendance, which also puts "
+                 "their historical rows out of reach of a repair. Use this to "
+                 "clean up corrupt history for someone who has left; it never "
+                 "creates new days for them.",
         )
         parser.add_argument(
             "--create-missing",
@@ -307,6 +317,18 @@ class Command(BaseCommand):
         row.save()
         return row
 
+    def _inactive_employee(self, badge):
+        """Resolve a badge to an inactive employee, exactly one match only."""
+        normalised = str(badge).strip().lstrip("0") or "0"
+        matches = [
+            candidate
+            for candidate in Employee.objects.filter(is_active=False).exclude(
+                badge_id=None
+            )
+            if (candidate.badge_id or "").strip().lstrip("0") == normalised
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     # ------------------------------------------------------------------- main
 
     def handle(self, *args, **options):
@@ -320,6 +342,7 @@ class Command(BaseCommand):
             raise CommandError("--until is before --since")
         apply = options["apply"]
         create_missing = options["create_missing"]
+        include_inactive = options["include_inactive"]
         only_badges = (
             {b.strip() for b in options["badges"].split(",")}
             if options.get("badges")
@@ -352,6 +375,12 @@ class Command(BaseCommand):
                     if only_badges is not None and badge not in only_badges:
                         continue
                     employee = employee_for_badge(badge)
+                    if employee is None and include_inactive:
+                        # employee_for_badge deliberately ignores inactive
+                        # staff. Resolve them explicitly here, with the same
+                        # zero-padding tolerance, so a leaver's corrupt history
+                        # can still be reconciled.
+                        employee = self._inactive_employee(badge)
                     if employee is None:
                         findings.append(f"  UNKNOWN BADGE  {badge} ({len(days)} days skipped)")
                         continue
@@ -369,7 +398,7 @@ class Command(BaseCommand):
                         if not problems:
                             continue
                         if row is None:
-                            if not create_missing:
+                            if not create_missing or not employee.is_active:
                                 findings.append(
                                     f"  NO DAY ROW  {badge} {day}: needs a clock-in "
                                     f"replay, not repaired"
