@@ -41,6 +41,12 @@ IN_CODES = {0, 128}
 # Badge 117 double-punches most mornings (e.g. 07:40:03 and 07:40:07).
 DEDUP_SECONDS = 90
 
+# Horilla computed worked hours from minute-truncated times; this command uses
+# exact punch seconds, so a minute of disagreement is an artefact, not damage.
+# Only rewrite a day's total when it is materially wrong — the double-imported
+# activities produced totals like 1199:49, not 10:02-vs-10:01.
+WORKED_HOUR_TOLERANCE_SECONDS = 300
+
 
 class Command(BaseCommand):
     help = "Reconcile attendance against CrossChex Cloud punch records."
@@ -188,6 +194,18 @@ class Command(BaseCommand):
         if len(activities) != len(pairs):
             problems.append(f"{len(activities)} activities, device shows {len(pairs)}")
 
+        # worked_hour drives overtime and validation, and the double-imported
+        # activities inflated it independently of the clock times. A day whose
+        # in/out and activity count happen to match can still carry a total
+        # like 1199:49, so compare it explicitly.
+        want_seconds = _duration_seconds(pairs)
+        want_hours = format_time(want_seconds)
+        have_seconds = _hm_seconds(row.attendance_worked_hour)
+        if abs(have_seconds - want_seconds) > WORKED_HOUR_TOLERANCE_SECONDS:
+            problems.append(
+                f"worked_hour {row.attendance_worked_hour} != device {want_hours}"
+            )
+
         return problems
 
     # ------------------------------------------------------------------ write
@@ -198,7 +216,6 @@ class Command(BaseCommand):
         for activity in activities:
             activity.delete()
 
-        duration = 0
         for punch_in, punch_out in pairs:
             AttendanceActivity.objects.create(
                 employee_id=employee,
@@ -211,9 +228,8 @@ class Command(BaseCommand):
                 clock_out=punch_out.time() if punch_out else None,
                 out_datetime=punch_out,
             )
-            if punch_out:
-                duration += int((punch_out - punch_in).total_seconds())
 
+        duration = _duration_seconds(pairs)
         first_in = pairs[0][0] if pairs else None
         last_out = pairs[-1][1] if pairs else None
         row.attendance_clock_in = first_in.time() if first_in else None
@@ -299,6 +315,24 @@ class Command(BaseCommand):
         )
         if findings and not apply:
             self.stdout.write("Re-run with --apply to write these corrections.")
+
+
+def _hm_seconds(value):
+    """Parse Horilla's 'HH:MM' worked-hour string into seconds."""
+    try:
+        hours, minutes = str(value).split(":")[:2]
+        return int(hours) * 3600 + int(minutes) * 60
+    except (ValueError, AttributeError):
+        return 0
+
+
+def _duration_seconds(pairs):
+    """Total worked seconds across a day's closed spans."""
+    return sum(
+        int((punch_out - punch_in).total_seconds())
+        for punch_in, punch_out in pairs
+        if punch_out is not None
+    )
 
 
 def _hm(value):
