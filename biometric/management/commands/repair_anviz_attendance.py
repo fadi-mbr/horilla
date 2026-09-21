@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 IN_CODES = {0, 128}
 
+# Two taps this close together are one person tapping twice, not a break.
+# Badge 117 double-punches most mornings (e.g. 07:40:03 and 07:40:07).
+DEDUP_SECONDS = 90
+
 
 class Command(BaseCommand):
     help = "Reconcile attendance against CrossChex Cloud punch records."
@@ -86,25 +90,67 @@ class Command(BaseCommand):
     # ----------------------------------------------------------------- derive
 
     def _pairs(self, punches):
-        """Pair the day's punches into (in, out) spans, in punch order.
+        """Pair a day's punches into (in, out) spans by alternation.
 
-        An OUT with no open IN, or an IN already open, is reported rather than
-        guessed at — this data feeds payroll.
+        The device's own check-type is not trustworthy: badge 103's 19:59
+        departure on 2026-08-24 is recorded as an IN (code 0), and several
+        staff double-tap. So ignore `checktype` entirely — collapse taps that
+        are seconds apart, then alternate from the first punch of the day,
+        which is always an arrival. An odd count leaves the last IN unclosed,
+        which is reported rather than guessed at; this data feeds payroll.
         """
-        pairs, anomalies, open_in = [], [], None
+        collapsed, anomalies = [], []
         for stamp, code in punches:
-            if code in IN_CODES:
-                if open_in is not None:
-                    anomalies.append(f"IN at {open_in:%H:%M} never closed")
-                open_in = stamp
-            else:
-                if open_in is None:
-                    anomalies.append(f"OUT at {stamp:%H:%M} with no open IN")
-                    continue
-                pairs.append((open_in, stamp))
-                open_in = None
-        if open_in is not None:
-            pairs.append((open_in, None))
+            if collapsed and (stamp - collapsed[-1]).total_seconds() <= DEDUP_SECONDS:
+                anomalies.append(
+                    f"double tap {collapsed[-1]:%H:%M:%S} / {stamp:%H:%M:%S}, collapsed"
+                )
+                continue
+            collapsed.append(stamp)
+
+        disagree = sum(
+            1
+            for idx, stamp in enumerate(collapsed)
+            for orig, code in punches
+            if orig == stamp and ((idx % 2 == 0) != (code in IN_CODES))
+        )
+        if disagree:
+            anomalies.append(
+                f"{disagree} punch(es) whose device check-type contradicts "
+                f"alternation; alternation used"
+            )
+
+        # A day's first punch is an arrival and its last is a departure. Pure
+        # alternation breaks that when someone misses a mid-day punch: the
+        # parity flips and the real evening departure reads as an unclosed
+        # arrival, which would erase a check-out Horilla already has right.
+        # So pair by alternation, then force the day to close on its last
+        # punch when the count is odd.
+        pairs = []
+        for idx in range(0, len(collapsed), 2):
+            punch_in = collapsed[idx]
+            punch_out = collapsed[idx + 1] if idx + 1 < len(collapsed) else None
+            pairs.append((punch_in, punch_out))
+
+        if len(collapsed) == 1:
+            anomalies.append(
+                f"single punch at {collapsed[0]:%H:%M}; no departure on the device"
+            )
+        elif pairs and pairs[-1][1] is None:
+            # Odd count: a punch was missed earlier in the day. Close the last
+            # span on the final punch and flag the span for human review
+            # rather than dropping the departure.
+            dangling = pairs[-1][0]
+            pairs[-1] = (dangling, collapsed[-1])
+            if dangling == collapsed[-1]:
+                pairs.pop()
+                pairs[-1] = (pairs[-1][0], collapsed[-1]) if pairs else pairs
+            anomalies.append(
+                f"odd punch count ({len(collapsed)}); a mid-day punch is missing, "
+                f"day closed on the last punch {collapsed[-1]:%H:%M} — worked hours "
+                f"need a human check"
+            )
+
         return pairs, anomalies
 
     # ------------------------------------------------------------- comparison
