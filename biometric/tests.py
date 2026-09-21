@@ -223,7 +223,7 @@ class FetchWindowAdvanceTests(TestCase):
 
     def test_recent_failed_punch_is_held_for_retry(self):
         """A punch that just failed is left inside the next fetch window."""
-        punched = datetime.utcnow().replace(microsecond=0) - timedelta(minutes=10)
+        punched = datetime.utcnow().replace(microsecond=0) - timedelta(minutes=5)
 
         with patch.object(
             CrossChexCloudAPI, "get_attendance_records",
@@ -243,10 +243,11 @@ class FetchWindowAdvanceTests(TestCase):
         """The stall of 2026-09-21: an unappliable punch blocked everyone.
 
         An OUT with no matching IN can never apply, so holding the window
-        behind it stalls the freshness marker indefinitely and makes the
-        importer re-fetch an ever-growing range.
+        behind it stalls the freshness marker and makes the importer re-fetch
+        an ever-growing range. last_fetch doubles as the liveness signal the
+        freshness monitor reads, so lag there blinds the monitor too.
         """
-        punched = datetime.utcnow().replace(microsecond=0) - timedelta(hours=6)
+        punched = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
 
         with patch.object(
             CrossChexCloudAPI, "get_attendance_records",
@@ -262,6 +263,11 @@ class FetchWindowAdvanceTests(TestCase):
             stored,
             punched,
             "a punch that cannot apply must not pin the window forever",
+        )
+        self.assertLess(
+            (datetime.utcnow() - stored).total_seconds(),
+            30 * 60,
+            "lag must stay well inside the freshness monitor's threshold",
         )
         self.assertLessEqual(
             stored,

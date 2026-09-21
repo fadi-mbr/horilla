@@ -67,12 +67,16 @@ logger = logging.getLogger(__name__)
 #
 # Deliberately short. A punch that fails once almost always fails forever — the
 # common case is an OUT with no matching IN, because the IN was dropped while
-# that employee had no shift. Holding the window for a day behind such a punch
-# stalls the freshness marker for everyone and makes the importer re-fetch an
-# ever-growing range. A whole-batch failure (an API or auth error) raises before
-# the window is saved at all, so transient faults are already covered without
-# this; an hour just buys a few retries for the rare genuine blip.
-ANVIZ_MAX_REPLAY_HOURS = 1
+# that employee had no shift. Holding the window behind such a punch stalls the
+# freshness marker for everyone and makes the importer re-fetch an ever-growing
+# range. A whole-batch failure (an API or auth error) raises before the window
+# is saved at all, so transient faults are already covered without this.
+#
+# This only buys a few retries for a rare genuine blip, so it is minutes, not
+# hours: `last_fetch` doubles as the liveness signal the freshness monitor
+# reads, and an hour of permanent lag would blind that monitor to a real stall.
+# Punches still unapplied after this are named in the log for repair.
+ANVIZ_MAX_REPLAY_MINUTES = 15
 
 # CrossChex badges that must never map to a Horilla employee.
 #   "1"   - "Admin MBR / CTO" on the device. Zero-pad matching would map it
@@ -2497,15 +2501,17 @@ def _anviz_biometric_attendance_logs(device):
     # so a punch that can never apply cannot pin ingestion for everyone.
     next_fetch_utc = current_utc_time
     if failed_punch_utc is not None:
-        replay_floor = current_utc_time - timedelta(hours=ANVIZ_MAX_REPLAY_HOURS)
+        replay_floor = current_utc_time - timedelta(
+            minutes=ANVIZ_MAX_REPLAY_MINUTES
+        )
         next_fetch_utc = max(failed_punch_utc, replay_floor)
         if failed_punch_utc < replay_floor:
             logger.error(
-                "Anviz punch at %s UTC still has not applied after %sh; advancing "
-                "the fetch window past it. %s punch(es) in this batch did not "
-                "apply and need a manual repair: %s",
+                "Anviz punch at %s UTC still has not applied after %s min; "
+                "advancing the fetch window past it. %s punch(es) in this batch "
+                "did not apply and need a manual repair: %s",
                 failed_punch_utc,
-                ANVIZ_MAX_REPLAY_HOURS,
+                ANVIZ_MAX_REPLAY_MINUTES,
                 len(unapplied),
                 "; ".join(unapplied[:20]),
             )
