@@ -15,7 +15,8 @@ from pathlib import Path
 from django.test import SimpleTestCase, TestCase
 
 from biometric.models import BiometricDevices
-from biometric.views import anviz_import_mutex
+from employee.models import Employee
+from biometric.views import anviz_import_mutex, employee_for_badge
 
 VIEWS_SOURCE = Path(__file__).resolve().parent / "views.py"
 
@@ -98,3 +99,49 @@ class NoDuplicateAnvizSchedulerTests(SimpleTestCase):
             anviz_branch.group(1),
             "views.py must not start a second Anviz scheduler; apps.py owns it",
         )
+
+
+class EmployeeForBadgeTests(TestCase):
+    """CrossChex sends '2'; Horilla stores '002'. Resolve that, but safely."""
+
+    def _employee(self, badge, first, active=True):
+        return Employee.objects.create(
+            employee_first_name=first,
+            employee_last_name="Test",
+            email=f"{first.lower().replace(' ', '.')}@example.invalid",
+            badge_id=badge,
+            is_active=active,
+        )
+
+    def test_exact_badge_match(self):
+        emp = self._employee("103", "Naif")
+        self.assertEqual(employee_for_badge("103"), emp)
+
+    def test_zero_padded_badge_matches(self):
+        """The bug: six managers' punches were dropped by this mismatch."""
+        emp = self._employee("002", "Micheal")
+        self.assertEqual(employee_for_badge("2"), emp)
+
+    def test_ignored_badges_never_match(self):
+        """'1' is Admin MBR on the device; '001' is a different person."""
+        self._employee("001", "Basel")
+        self.assertIsNone(employee_for_badge("1"))
+        self.assertIsNone(employee_for_badge("101"))
+
+    def test_inactive_employee_never_matches(self):
+        """A resigned employee whose badge still works accrues no attendance."""
+        self._employee("102", "Abraham", active=False)
+        self.assertIsNone(employee_for_badge("102"))
+
+    def test_ambiguous_normalisation_is_refused(self):
+        """Two candidates must not be guessed between."""
+        self._employee("007", "Ata")
+        self._employee("7", "Other")
+        self.assertIsNone(employee_for_badge("07"))
+
+    def test_unknown_badge_returns_none(self):
+        self.assertIsNone(employee_for_badge("999"))
+
+    def test_blank_badge_returns_none(self):
+        self.assertIsNone(employee_for_badge(None))
+        self.assertIsNone(employee_for_badge("  "))

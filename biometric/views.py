@@ -64,6 +64,12 @@ logger = logging.getLogger(__name__)
 # importer gives up on it and moves on (see anviz_biometric_attendance_logs).
 ANVIZ_MAX_REPLAY_HOURS = 24
 
+# CrossChex badges that must never map to a Horilla employee.
+#   "1"   - "Admin MBR / CTO" on the device. Zero-pad matching would map it
+#           onto Horilla's "001", who is a different person entirely.
+#   "101" - the Owner's device badge; not attendance-tracked.
+ANVIZ_BADGE_IGNORE = {"1", "101"}
+
 
 def str_time_seconds(time):
     """
@@ -2274,6 +2280,46 @@ def zk_biometric_attendance_scheduler(device_id):
         zk_biometric_attendance_logs(device)
 
 
+def employee_for_badge(badge_id):
+    """Resolve a CrossChex badge to a Horilla employee.
+
+    The device sends the badge as entered ("2"), while Horilla stores it
+    zero-padded ("002"), so an exact match silently dropped every punch from
+    the six management staff — roughly 330 employee-days. Fall back to
+    comparing without leading zeros, but only when exactly one active employee
+    matches: guessing between two would attribute someone's attendance to
+    somebody else. Inactive employees never match, so a resigned person whose
+    badge still works on the door accrues no attendance.
+    """
+    if badge_id is None:
+        return None
+    badge = str(badge_id).strip()
+    if not badge or badge in ANVIZ_BADGE_IGNORE:
+        return None
+
+    employee = Employee.objects.filter(badge_id=badge, is_active=True).first()
+    if employee is not None:
+        return employee
+
+    normalised = badge.lstrip("0") or "0"
+    matches = [
+        candidate
+        for candidate in Employee.objects.filter(is_active=True).exclude(badge_id=None)
+        if (candidate.badge_id or "").strip().lstrip("0") == normalised
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning(
+            "Badge %s matches %s active employees after normalisation (%s); "
+            "skipping rather than guessing.",
+            badge,
+            len(matches),
+            ", ".join(str(m.badge_id) for m in matches),
+        )
+    return None
+
+
 @contextmanager
 def anviz_import_mutex(device):
     """Serialise Anviz imports for one device across every caller.
@@ -2345,7 +2391,7 @@ def _anviz_biometric_attendance_logs(device):
             attendance["checktime"], "%Y-%m-%dT%H:%M:%S%z"
         )
         date_time_obj = date_time_utc.astimezone(django_timezone.get_current_timezone())
-        employee = Employee.objects.filter(badge_id=badge_id).first()
+        employee = employee_for_badge(badge_id)
         if employee:
             # Idempotency guard: overlapping fetch windows re-deliver punches
             # (the window opens at the previous run's START, and a paced

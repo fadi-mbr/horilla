@@ -29,9 +29,10 @@ from django.utils import timezone as django_timezone
 from attendance.methods.utils import format_time, overtime_calculation
 from attendance.models import Attendance, AttendanceActivity
 from attendance.views.views import attendance_validate
+from base.models import EmployeeShiftDay, EmployeeShiftSchedule
 from biometric.anviz import CrossChexCloudAPI
 from biometric.models import BiometricDevices
-from employee.models import Employee
+from biometric.views import employee_for_badge
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,16 @@ class Command(BaseCommand):
             "--until", help="Last attendance date to check (YYYY-MM-DD). Default: today."
         )
         parser.add_argument("--device-id", help="Restrict to one Anviz device UUID.")
+        parser.add_argument(
+            "--badges",
+            help="Restrict to these comma-separated badge ids (as CrossChex sends them).",
+        )
+        parser.add_argument(
+            "--create-missing",
+            action="store_true",
+            help="Also create day rows for employee-days that have none at all "
+                 "(staff whose punches were discarded before they had a shift).",
+        )
         parser.add_argument(
             "--apply",
             action="store_true",
@@ -241,6 +252,54 @@ class Command(BaseCommand):
         row.attendance_validated = attendance_validate(row)
         row.save()
 
+    def _create_day(self, employee, day, pairs):
+        """Create a day row and its activities for a day Horilla never recorded."""
+        info = getattr(employee, "employee_work_info", None)
+        shift = getattr(info, "shift_id", None)
+        if shift is None:
+            return None
+
+        shift_day = EmployeeShiftDay.objects.filter(
+            day=day.strftime("%A").lower()
+        ).first()
+        schedule = EmployeeShiftSchedule.objects.filter(
+            shift_id=shift, day=shift_day
+        ).first()
+        if schedule is None:
+            return None
+
+        first_in = pairs[0][0] if pairs else None
+        last_out = pairs[-1][1] if pairs else None
+        row = Attendance.objects.create(
+            employee_id=employee,
+            attendance_date=day,
+            shift_id=shift,
+            work_type_id=getattr(info, "work_type_id", None),
+            attendance_day=shift_day,
+            attendance_clock_in=first_in.time() if first_in else None,
+            attendance_clock_in_date=first_in.date() if first_in else None,
+            minimum_hour=schedule.minimum_working_hour,
+        )
+        for punch_in, punch_out in pairs:
+            AttendanceActivity.objects.create(
+                employee_id=employee,
+                attendance_date=day,
+                shift_day=shift_day,
+                clock_in_date=punch_in.date(),
+                clock_in=punch_in.time(),
+                in_datetime=punch_in,
+                clock_out_date=punch_out.date() if punch_out else None,
+                clock_out=punch_out.time() if punch_out else None,
+                out_datetime=punch_out,
+            )
+        row.attendance_clock_out = last_out.time() if last_out else None
+        row.attendance_clock_out_date = last_out.date() if last_out else None
+        row.attendance_worked_hour = format_time(_duration_seconds(pairs))
+        row.attendance_overtime = overtime_calculation(row)
+        row.attendance_validated = attendance_validate(row)
+        row.save()
+        return row
+
     # ------------------------------------------------------------------- main
 
     def handle(self, *args, **options):
@@ -253,6 +312,12 @@ class Command(BaseCommand):
         if until < since:
             raise CommandError("--until is before --since")
         apply = options["apply"]
+        create_missing = options["create_missing"]
+        only_badges = (
+            {b.strip() for b in options["badges"].split(",")}
+            if options.get("badges")
+            else None
+        )
 
         devices = BiometricDevices.objects.filter(machine_type="anviz", is_active=True)
         if options.get("device_id"):
@@ -270,7 +335,9 @@ class Command(BaseCommand):
         for device in devices:
             punches = self._punches(device, since, until)
             for badge, days in sorted(punches.items()):
-                employee = Employee.objects.filter(badge_id=badge).first()
+                if only_badges is not None and badge not in only_badges:
+                    continue
+                employee = employee_for_badge(badge)
                 if employee is None:
                     findings.append(f"  UNKNOWN BADGE  {badge} ({len(days)} days skipped)")
                     continue
@@ -288,9 +355,25 @@ class Command(BaseCommand):
                     if not problems:
                         continue
                     if row is None:
+                        if not create_missing:
+                            findings.append(
+                                f"  NO DAY ROW  {badge} {day}: needs a clock-in "
+                                f"replay, not repaired"
+                            )
+                            continue
+                        if apply:
+                            with transaction.atomic():
+                                created = self._create_day(employee, day, pairs)
+                            if created is None:
+                                findings.append(
+                                    f"  SKIP   {badge} {day}: no shift or schedule"
+                                )
+                                continue
+                            repaired += 1
                         findings.append(
-                            f"  NO DAY ROW  {badge} {day}: needs a clock-in replay, "
-                            f"not repaired"
+                            f"  {'CREATE' if apply else 'WOULD CREATE'} {badge} {day}: "
+                            f"in={_hm(pairs[0][0]) if pairs else '--:--'} "
+                            f"out={_hm(pairs[-1][1]) if pairs else '--:--'}"
                         )
                         continue
 
