@@ -10,13 +10,21 @@ clock-in nulled that day's clock-out in `clock_in_attendance_and_activity`.
 
 import multiprocessing
 import re
+from datetime import date, datetime, time
 from pathlib import Path
+from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
 
 from biometric.models import BiometricDevices
 from employee.models import Employee
-from biometric.views import anviz_import_mutex, employee_for_badge
+from attendance.models import AttendanceActivity
+from biometric.anviz import CrossChexCloudAPI
+from biometric.views import (
+    anviz_biometric_attendance_logs,
+    anviz_import_mutex,
+    employee_for_badge,
+)
 
 VIEWS_SOURCE = Path(__file__).resolve().parent / "views.py"
 
@@ -145,3 +153,87 @@ class EmployeeForBadgeTests(TestCase):
     def test_blank_badge_returns_none(self):
         self.assertIsNone(employee_for_badge(None))
         self.assertIsNone(employee_for_badge("  "))
+
+
+class FetchWindowAdvanceTests(TestCase):
+    """The fetch window must advance when punches actually land.
+
+    `clock_in`/`clock_out` render a template against a fake request object and
+    raise AFTER writing. Treating that exception as a failed import pinned
+    `last_fetch` permanently, so the importer re-fetched an ever-growing window
+    and the freshness monitor read as stale forever.
+    """
+
+    def setUp(self):
+        self.device = BiometricDevices.objects.create(
+            name="Test Anviz",
+            machine_type="anviz",
+            is_active=True,
+            is_scheduler=True,
+            scheduler_duration="00:05",
+            last_fetch_date=date(2026, 9, 21),
+            last_fetch_time=time(8, 0),
+        )
+        self.employee = Employee.objects.create(
+            employee_first_name="Punch",
+            employee_last_name="Tester",
+            email="punch.tester@example.invalid",
+            badge_id="500",
+        )
+
+    def _records(self, punched_at):
+        return {
+            "list": [
+                {
+                    "checktime": punched_at.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                    "checktype": 0,
+                    "employee": {"workno": "500"},
+                }
+            ]
+        }
+
+    def test_window_advances_when_the_punch_landed_despite_an_exception(self):
+        punched = datetime(2026, 9, 21, 9, 0, 0)
+
+        def write_then_raise(request):
+            AttendanceActivity.objects.create(
+                employee_id=self.employee,
+                attendance_date=request.date,
+                clock_in_date=request.date,
+                clock_in=request.time,
+            )
+            raise AttributeError("'dict' object has no attribute 'session_key'")
+
+        with patch.object(
+            CrossChexCloudAPI, "get_attendance_records",
+            return_value=self._records(punched),
+        ), patch("biometric.views.clock_in", side_effect=write_then_raise):
+            anviz_biometric_attendance_logs(self.device)
+
+        self.device.refresh_from_db()
+        stored = datetime.combine(
+            self.device.last_fetch_date, self.device.last_fetch_time
+        )
+        self.assertGreater(
+            stored,
+            punched,
+            "the window must advance past a punch that was stored; holding it "
+            "at the punch re-fetches an ever-growing window forever",
+        )
+
+    def test_window_is_held_back_when_the_punch_did_not_land(self):
+        punched = datetime(2026, 9, 21, 9, 0, 0)
+
+        with patch.object(
+            CrossChexCloudAPI, "get_attendance_records",
+            return_value=self._records(punched),
+        ), patch("biometric.views.clock_in", side_effect=RuntimeError("boom")):
+            anviz_biometric_attendance_logs(self.device)
+
+        self.device.refresh_from_db()
+        stored = datetime.combine(
+            self.device.last_fetch_date, self.device.last_fetch_time
+        )
+        self.assertLessEqual(
+            stored, punched, "a genuinely failed punch must be re-fetched"
+        )
